@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
+from aiohttp import web
 from config import BOT_TOKEN
 from keyboards import get_main_menu, get_back_button
 from database import db
@@ -66,11 +67,26 @@ async def help_callback(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=get_back_button(), parse_mode="Markdown")
     await callback.answer()
 
+# Render Web Service-এর জন্য ডামি সার্ভার লজিক
+async def handle(request):
+    return web.Response(text="Gmail Farmer Bot is running 24/7!")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    
+    # ব্যাকগ্রাউন্ডে ডামি সার্ভার চালু রাখা
+    asyncio.create_task(start_dummy_server())
     
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
