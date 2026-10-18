@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 from supabase import create_client, Client
 from config import SUPABASE_URL, SUPABASE_KEY
 
@@ -15,7 +16,6 @@ class Database:
 
     # --- SETTINGS MANAGEMENT ---
     async def get_setting(self, key: str, default_value: str = "") -> str:
-        """ডাটাবেজ থেকে ডায়নামিক কনফিগারেশন পড়া"""
         try:
             res = self.supabase.table("settings").select("value").eq("key", key).execute()
             if res.data:
@@ -26,7 +26,6 @@ class Database:
             return default_value
 
     async def update_setting(self, key: str, value: str) -> bool:
-        """এডমিন প্যানেল থেকে কনফিগারেশন পরিবর্তন করা"""
         try:
             self.supabase.table("settings").upsert({"key": key, "value": value}).execute()
             return True
@@ -46,7 +45,8 @@ class Database:
                     "completed_tasks": 0,
                     "referred_by": referred_by if referred_by != user_id else None,
                     "referral_count": 0,
-                    "referral_income": 0.0
+                    "referral_income": 0.0,
+                    "is_banned": False
                 }
                 inserted = self.supabase.table("users").insert(user_data).execute()
                 
@@ -60,7 +60,47 @@ class Database:
             return res.data[0]
         except Exception as e:
             logger.error(f"Error in get_or_create_user: {e}")
-            return {"user_id": user_id, "balance": 0.0, "completed_tasks": 0, "referral_count": 0, "referral_income": 0.0}
+            return {"user_id": user_id, "balance": 0.0, "completed_tasks": 0, "referral_count": 0, "referral_income": 0.0, "is_banned": False}
+
+    async def claim_daily_bonus(self, user_id: int) -> tuple[bool, str, float]:
+        """ডেইলি বোনাস দাবি করার লজিক"""
+        try:
+            user = await self.get_or_create_user(user_id, "")
+            today_str = date.today().isoformat()
+            
+            if user.get("last_checkin") == today_str:
+                return False, "⚠️ আপনি আজকের বোনাস ইতিমধ্যেই দাবি করেছেন! আগামীকাল আবার চেষ্টা করুন।", 0.0
+
+            bonus_amount = float(await self.get_setting("daily_bonus", "1.0"))
+            new_balance = float(user.get("balance", 0.0)) + bonus_amount
+
+            self.supabase.table("users").update({
+                "balance": new_balance,
+                "last_checkin": today_str
+            }).eq("user_id", user_id).execute()
+
+            return True, f"🎉 আপনি সফলভাবে <b>+{bonus_amount} BDT</b> ডেইলি বোনাস পেয়েছেন!", bonus_amount
+        except Exception as e:
+            logger.error(f"Error claiming daily bonus: {e}")
+            return False, "⚠️ বোনাস ক্লেইম করতে সমস্যা হয়েছে।", 0.0
+
+    async def get_all_user_ids(self) -> list:
+        """ব্রডকাস্টিংয়ের জন্য সমস্ত ইউজারের আইডি আনা"""
+        try:
+            res = self.supabase.table("users").select("user_id").execute()
+            return [r["user_id"] for r in res.data] if res.data else []
+        except Exception as e:
+            logger.error(f"Error fetching user ids: {e}")
+            return []
+
+    async def set_user_ban_status(self, user_id: int, ban: bool) -> bool:
+        """ইউজার ব্যান বা আনব্যান করা"""
+        try:
+            self.supabase.table("users").update({"is_banned": ban}).eq("user_id", user_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating ban status: {e}")
+            return False
 
     # --- TASK MANAGEMENT ---
     async def add_bulk_tasks(self, task_list: list) -> int:
@@ -96,7 +136,6 @@ class Database:
                 "completed_tasks": new_completed
             }).eq("user_id", user_id).execute()
             
-            # ডায়নামিক রেফারেল কমিশন হিসাব
             referred_by = user.get("referred_by")
             if referred_by:
                 commission_pct = float(await self.get_setting("referral_commission", "10.0")) / 100.0
@@ -150,15 +189,15 @@ class Database:
             logger.error(f"Error fetching withdrawals: {e}")
             return []
 
-    async def update_withdrawal_status(self, withdrawal_id: int, status: str) -> bool:
+    async def update_withdrawal_status(self, withdrawal_id: int, status: str) -> tuple[bool, dict | None]:
         try:
             res = self.supabase.table("withdrawals").select("*").eq("id", withdrawal_id).execute()
             if not res.data:
-                return False
+                return False, None
             
             req = res.data[0]
             if req["status"] != "pending":
-                return False
+                return False, None
 
             self.supabase.table("withdrawals").update({"status": status}).eq("id", withdrawal_id).execute()
 
@@ -169,10 +208,10 @@ class Database:
                 refund_balance = float(user.get("balance", 0.0)) + amount
                 self.supabase.table("users").update({"balance": refund_balance}).eq("user_id", user_id).execute()
 
-            return True
+            return True, req
         except Exception as e:
             logger.error(f"Error updating withdrawal status: {e}")
-            return False
+            return False, None
 
     async def get_all_users_count(self) -> int:
         try:
