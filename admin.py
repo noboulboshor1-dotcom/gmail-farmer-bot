@@ -20,23 +20,18 @@ class AdminStates(StatesGroup):
     waiting_for_daily_bonus = State()
     waiting_for_proof_channel = State()
     waiting_for_broadcast_msg = State()
-    waiting_for_ban_userid = State()
-    waiting_for_unban_userid = State()
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 async def get_admin_keyboard():
-    tasks_enabled = (await db.get_setting("tasks_enabled", "true")) == "true"
-    toggle_text = "🟢 Disable Tasks" if tasks_enabled else "🔴 Enable Tasks"
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add Tasks (Bulk)", callback_data="admin_add_bulk")],
-        [InlineKeyboardButton(text=toggle_text, callback_data="admin_toggle_tasks")],
+        [InlineKeyboardButton(text="📂 Manage Task Categories", callback_data="admin_categories")],
+        [InlineKeyboardButton(text="👥 User List & Ban Control", callback_data="admin_users_page_1")],
         [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="⚙️ Bot Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton(text="💳 Pending Withdrawals", callback_data="admin_withdrawals")],
-        [InlineKeyboardButton(text="🚫 Ban User", callback_data="admin_ban"), InlineKeyboardButton(text="✅ Unban User", callback_data="admin_unban")]
+        [InlineKeyboardButton(text="💳 Pending Withdrawals", callback_data="admin_withdrawals")]
     ])
     return keyboard
 
@@ -57,21 +52,122 @@ async def cmd_admin(message: Message):
     kb = await get_admin_keyboard()
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-@admin_router.callback_query(F.data == "admin_toggle_tasks")
-async def handle_toggle_tasks(callback: CallbackQuery):
+# --- CATEGORY MANAGEMENT ---
+@admin_router.callback_query(F.data == "admin_categories")
+async def handle_admin_categories(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
 
-    current = await db.get_setting("tasks_enabled", "true")
-    new_status = "false" if current == "true" else "true"
-    await db.update_setting("tasks_enabled", new_status)
+    categories = await db.get_categories()
+    keyboard_buttons = []
     
-    status_msg = "বন্ধ" if new_status == "false" else "চালু"
-    await callback.answer(f"⚠️ টাস্ক সেকশন এখন {status_msg} করা হয়েছে!", show_alert=True)
+    for cat in categories:
+        status_icon = "🟢 চালু" if cat["is_enabled"] else "🔴 বন্ধ"
+        btn_text = f"{cat['category_name']} ({status_icon})"
+        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"toggle_cat_{cat['category_key']}")])
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    kb = await get_admin_keyboard()
+    await callback.message.edit_text("📂 <b>টাস্ক ক্যাটাগরি ম্যানেজমেন্ট:</b>\nযে ক্যাটাগরি অন বা অফ করতে চান তাতে ক্লিক করুন:", reply_markup=kb, parse_mode="HTML")
+
+@admin_router.callback_query(F.data.startswith("toggle_cat_"))
+async def handle_toggle_category(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    cat_key = callback.data.replace("toggle_cat_", "")
+    new_status = await db.toggle_category(cat_key)
+    
+    status_msg = "চালু" if new_status else "বন্ধ"
+    await callback.answer(f"⚠️ ক্যাটাগরি সফলভাবে {status_msg} করা হয়েছে!", show_alert=True)
+    
+    categories = await db.get_categories()
+    keyboard_buttons = []
+    for cat in categories:
+        status_icon = "🟢 চালু" if cat["is_enabled"] else "🔴 বন্ধ"
+        btn_text = f"{cat['category_name']} ({status_icon})"
+        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"toggle_cat_{cat['category_key']}")])
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await callback.message.edit_reply_markup(reply_markup=kb)
 
+# --- PAGINATED USER LIST & BAN CONTROL ---
+@admin_router.callback_query(F.data.startswith("admin_users_page_"))
+async def handle_admin_user_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    page = int(callback.data.replace("admin_users_page_", ""))
+    limit = 6
+    users = await db.get_users_paginated(page, limit)
+    total_count = await db.get_all_users_count()
+    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
+
+    if not users:
+        await callback.answer("⚠️ কোনো ইউজার পাওয়া যায়নি।", show_alert=True)
+        return
+
+    text = f"👥 <b>বোটের ইউজার ম্যানেজমেন্ট (পেজ {page}/{total_pages}):</b>\n\n"
+    
+    keyboard_buttons = []
+    for u in users:
+        uid = u["user_id"]
+        uname = u.get("username", "User")
+        bal = u.get("balance", 0.0)
+        banned = u.get("is_banned", False)
+        
+        status_str = "🔴 Ban" if not banned else "🟢 Unban"
+        status_badge = "🚫 [Banned]" if banned else "✅ [Active]"
+        
+        text += f"• <b>{uname}</b> {status_badge}\n  ID: <code>{uid}</code> | Bal: <b>{bal} BDT</b>\n"
+        
+        keyboard_buttons.append([
+            InlineKeyboardButton(text=f"👤 {uname}", callback_data="none"),
+            InlineKeyboardButton(text=status_str, callback_data=f"toggle_ban_{uid}_{page}")
+        ])
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_users_page_{page-1}"))
+    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="none"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard_buttons.append(nav_buttons)
+        
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("toggle_ban_"))
+async def handle_toggle_ban_inline(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    parts = callback.data.split("_")
+    uid = int(parts[2])
+    page = int(parts[3])
+
+    user = await db.get_or_create_user(uid, "")
+    current_ban = user.get("is_banned", False)
+    new_ban_status = not current_ban
+    
+    await db.set_user_ban_status(uid, new_ban_status)
+    
+    action_name = "ব্যান" if new_ban_status else "আনব্যান"
+    await callback.answer(f"ইউজার {uid} কে সফলভাবে {action_name} করা হয়েছে!", show_alert=True)
+
+    callback.data = f"admin_users_page_{page}"
+    await handle_admin_user_list(callback)
+
+# --- SETTINGS & BROADCAST ---
 @admin_router.callback_query(F.data == "admin_settings")
 async def handle_admin_settings(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -141,7 +237,7 @@ async def handle_edit_proof_channel(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.set_state(AdminStates.waiting_for_proof_channel)
-    await callback.message.edit_text("✏️ আপনার পেমেন্ট প্রুফ চ্যানেলের ইউজারনেম লিখে পাঠান (যেমন: <code>@Technova_Proof</code>):", parse_mode="HTML")
+    await callback.message.edit_text("✏️ পেমেন্ট প্রুফ চ্যানেলের ইউজারনেম লিখে পাঠান (যেমন: <code>@Technova_Proof</code>):", parse_mode="HTML")
 
 @admin_router.message(AdminStates.waiting_for_proof_channel)
 async def process_new_proof_channel(message: Message, state: FSMContext):
@@ -154,7 +250,6 @@ async def process_new_proof_channel(message: Message, state: FSMContext):
     await message.answer(f"✅ পেমেন্ট প্রুফ চ্যানেল সফলভাবে <b>{ch_name}</b> সেট করা হয়েছে!", parse_mode="HTML")
     await state.clear()
 
-# --- BROADCASTING ---
 @admin_router.callback_query(F.data == "admin_broadcast")
 async def handle_broadcast_click(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -175,50 +270,11 @@ async def process_broadcast_send(message: Message, state: FSMContext):
         try:
             await message.copy_to(chat_id=uid)
             sent_count += 1
-            await asyncio.sleep(0.05) # রেট লিমিট এড়াতে ডিলে
+            await asyncio.sleep(0.05)
         except Exception:
             pass
 
     await message.answer(f"✅ সফলভাবে <b>{sent_count}</b> জন ইউজারের কাছে ব্রডকাস্ট মেসেজ পাঠানো হয়েছে!", parse_mode="HTML")
-    await state.clear()
-
-# --- BAN / UNBAN SYSTEM ---
-@admin_router.callback_query(F.data == "admin_ban")
-async def handle_ban_click(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_ban_userid)
-    await callback.message.edit_text("🚫 যাকে ব্যান করতে চান তার **ইউজার আইডি (User ID)** লিখে পাঠান:")
-
-@admin_router.message(AdminStates.waiting_for_ban_userid)
-async def process_ban_user(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if message.text.strip().isdigit():
-        uid = int(message.text.strip())
-        await db.set_user_ban_status(uid, True)
-        await message.answer(f"🚫 ইউজার <code>{uid}</code> কে সফলভাবে **ব্যান** করা হয়েছে!", parse_mode="HTML")
-    else:
-        await message.answer("⚠️ সঠিক ইউজার আইডি দিন।")
-    await state.clear()
-
-@admin_router.callback_query(F.data == "admin_unban")
-async def handle_unban_click(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_unban_userid)
-    await callback.message.edit_text("✅ যাকে আনব্যান করতে চান তার **ইউজার আইডি (User ID)** লিখে পাঠান:")
-
-@admin_router.message(AdminStates.waiting_for_unban_userid)
-async def process_unban_user(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if message.text.strip().isdigit():
-        uid = int(message.text.strip())
-        await db.set_user_ban_status(uid, False)
-        await message.answer(f"✅ ইউজার <code>{uid}</code> কে সফলভাবে **আনব্যান** করা হয়েছে!", parse_mode="HTML")
-    else:
-        await message.answer("⚠️ সঠিক ইউজার আইডি দিন।")
     await state.clear()
 
 @admin_router.callback_query(F.data == "admin_back")
@@ -228,7 +284,6 @@ async def handle_admin_back(callback: CallbackQuery):
     kb = await get_admin_keyboard()
     await callback.message.edit_text("👑 <b>এডমিন কন্ট্রোল প্যানেল</b>", reply_markup=kb, parse_mode="HTML")
 
-# --- WITHDRAWALS WITH AUTO PROOF CHANNEL ---
 @admin_router.callback_query(F.data == "admin_withdrawals")
 async def handle_admin_withdrawals(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -277,7 +332,6 @@ async def handle_withdrawal_action(callback: CallbackQuery):
     if success and req_data:
         if status == "approved":
             msg = "✅ উইথড্রো এপ্রুভ হয়েছে।"
-            # অটো পেমেন্ট প্রুফ চ্যানেলে মেসেজ পাঠানো
             try:
                 proof_chan = await db.get_setting("proof_channel", "")
                 if proof_chan and proof_chan.startswith("@"):
@@ -292,7 +346,6 @@ async def handle_withdrawal_action(callback: CallbackQuery):
                     await callback.bot.send_message(chat_id=proof_chan, text=proof_text, parse_mode="HTML")
             except Exception as e:
                 logger.error(f"Error posting to proof channel: {e}")
-
         else:
             msg = "❌ উইথড্রো রিজেক্ট এবং টাকা রিফান্ড করা হয়েছে।"
 
