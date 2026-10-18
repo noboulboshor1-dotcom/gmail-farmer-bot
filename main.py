@@ -11,6 +11,7 @@ from aiohttp import web
 from config import BOT_TOKEN
 from database import db
 from admin import admin_router
+from withdraw import withdraw_router
 from tasks import task_manager
 from verifier import inbox_verifier
 
@@ -24,11 +25,12 @@ class TaskStates(StatesGroup):
     working_on_task = State()
 
 def get_main_keyboard():
-    """মূল মেনু কিবোর্ড"""
+    """মূল মেনু কিবোর্ড (উইথড্রো বাটন সহ)"""
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Register a new Gmail")],
-            [KeyboardButton(text="👤 My Profile"), KeyboardButton(text="🔗 Referral Link")]
+            [KeyboardButton(text="👤 My Profile"), KeyboardButton(text="🔗 Referral Link")],
+            [KeyboardButton(text="💵 Withdraw")]
         ],
         resize_keyboard=True
     )
@@ -63,7 +65,7 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         f"👋 স্বাগতম <b>{message.from_user.first_name}</b>!\n\n"
         "🤖 এটি আপনার অটোমেটেড জিমেইল ফার্মিং এবং টাস্ক আর্নিং বট।\n"
-        "নিচের বাটন থেকে নতুন টাস্ক নিয়ে কাজ শুরু করুন এবং রেফার করে ১০% কমিশন অর্জন করুন!"
+        "নিচের বাটন থেকে নতুন টাস্ক নিয়ে কাজ শুরু করুন, রেফার করে কমিশন পান এবং সহজে উইথড্রো করুন!"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
@@ -111,7 +113,7 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     task = data.get("current_task")
 
     if not task:
-        await callback.answer("⚠️ কোনোভুল বা মেয়াদোত্তীর্ণ টাস্ক। আবার চেষ্টা করুন।", show_alert=True)
+        await callback.answer("⚠️ কোনো ভুল বা মেয়াদোত্তীর্ণ টাস্ক। আবার চেষ্টা করুন।", show_alert=True)
         await state.clear()
         return
 
@@ -171,7 +173,7 @@ async def handle_referral(message: Message):
 
     text = (
         "🔗 <b>রেফারেল প্রোগ্রাম (১০% কমিশন):</b>\n\n"
-        "আপনার বন্ধুদের আমাদের বোটে আমন্ত্রণ জানান। তারা জিমেইল টাস্ক সম্পন্ন করে যে পেমেন্ট বা পয়েন্ট পাবে, তার ওপর আপনি আজীবন <b>১০% কমিশন</b> পাবেন!\n\n"
+        "আপনার বন্ধুদের আমাদের বোটে আমন্ত্রণ জানান। তারা জিমেইল টাস্ক সম্পন্ন করে যে পেমেন্ট পাবে, তার ওপর আপনি আজীবন <b>১০% কমিশন</b> পাবেন!\n\n"
         "আপনার রেফারেল লিংক:\n"
         f"<code>{ref_link}</code>"
     )
@@ -196,8 +198,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
 
-    # রাউটারগুলো রেজিস্টার করা
+    # সমস্ত রাউটার রেজিস্টার করা (এডমিন, উইথড্রো এবং মেইন ইউজার)
     dp.include_router(admin_router)
+    dp.include_router(withdraw_router)
     dp.include_router(router)
 
     # রেন্ডারের জন্য ব্যাকগ্রাউন্ড ওয়েব সার্ভার চালু করা
