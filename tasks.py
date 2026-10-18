@@ -2,27 +2,24 @@ import random
 import string
 
 class TaskManager:
-    def generate_random_gmail(self):
-        """একটি অটোমেটেড টেস্ট জিমেইল ইউজারনেম ও পাসওয়ার্ড তৈরি করে"""
-        first_names = ["rahim", "karim", "tanvir", "sakib", "hasan", "arif", "sabbir"]
-        last_names = ["ahmed", "khan", "chowdhury", "mia", "hossain", "islam"]
+    @staticmethod
+    def generate_random_gmail() -> dict:
+        """সটকে টাস্ক না থাকলে অটো র্যান্ডম জিমেইল জেনারেট করার ফলব্যাক সিস্টেম"""
+        first_names = ["sidney", "alex", "david", "michael", "robert", "john", "william", "james"]
+        name = random.choice(first_names)
+        random_num = ''.join(random.choices(string.digits, k=4))
+        random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         
-        name = f"{random.choice(first_names)}{random.choice(last_names)}"
-        digits = "".join(random.choices(string.digits, k=4))
-        username = f"{name}{digits}@gmail.com"
-        
-        # পাসওয়ার্ড জেনারেটর
-        chars = string.ascii_letters + string.digits + "@#$"
-        password = "".join(random.choices(chars, k=10))
-        
-        # রিকভারি ইমেইল
-        recovery_email = f"rec.{digits}@mailtrap.io"
+        email = f"{name}{random_num}{random_chars}@gmail.com"
+        password = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$", k=10))
+        recovery = f"rec.{random_chars}@mailtrap.io"
         
         return {
-            "email": username,
+            "id": 0,  # ডামি আইডি
+            "email": email,
             "password": password,
-            "recovery": recovery_email,
-            "reward": 10.0  # প্রতি জিমেইলের জন্য ১০ টাকা
+            "recovery": recovery,
+            "reward": 10.0
         }
 
 task_manager = TaskManager()
