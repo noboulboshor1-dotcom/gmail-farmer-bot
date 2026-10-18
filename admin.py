@@ -118,7 +118,7 @@ async def handle_admin_user_list(callback: CallbackQuery):
         bal = u.get("balance", 0.0)
         banned = u.get("is_banned", False)
         
-        status_str = "🔴 Ban" if not banned else "🟢 Unban"
+        status_str = "🟢 Unban" if banned else "🔴 Ban"
         status_badge = "🚫 [Banned]" if banned else "✅ [Active]"
         
         text += f"• <b>{uname}</b> {status_badge}\n  ID: <code>{uid}</code> | Bal: <b>{bal} BDT</b>\n"
