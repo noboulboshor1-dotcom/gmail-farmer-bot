@@ -23,14 +23,13 @@ router = Router()
 class TaskStates(StatesGroup):
     working_on_task = State()
 
-# --- BAN CHECK MIDDLEWARE ---
 @router.message.outer_middleware()
 async def check_banned_user(handler, event, data):
     if hasattr(event, "from_user") and event.from_user:
         user = await db.get_or_create_user(event.from_user.id, "")
         if user.get("is_banned"):
             if isinstance(event, Message):
-                await event.answer("🚫 <b>আপনার অ্যাকাউন্টটি ব্যান করা হয়েছে!</b>\nএডমিনের সাথে যোগাযোগ করুন।", parse_mode="HTML")
+                await event.answer("🚫 <b>আপনার অ্যাকাউন্টটি ব্যান করা হয়েছে!</b>", parse_mode="HTML")
             return
     return await handler(event, data)
 
@@ -44,20 +43,6 @@ def get_main_keyboard():
         ],
         resize_keyboard=True
     )
-    return keyboard
-
-def get_task_category_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📧 Gmail Tasks", callback_data="start_gmail_task")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")]
-    ])
-    return keyboard
-
-def get_task_action_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Verify Task", callback_data="verify_task")],
-        [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
-    ])
     return keyboard
 
 @router.message(CommandStart())
@@ -77,60 +62,70 @@ async def cmd_start(message: Message, state: FSMContext):
 
     welcome_text = (
         f"👋 স্বাগতম <b>{message.from_user.first_name}</b>!\n\n"
-        "🤖 এটি আপনার প্রিমিয়াম জিমেইল ফার্মিং এবং আর্নিং বট।\n"
-        "নিচের মেনু থেকে টাস্ক সম্পন্ন করুন, ডেইলি বোনাস নিন, রেফার করুন এবং সহজে উইথড্রো করুন!"
+        "🤖 এটি আপনার প্রিমিয়াম জিমেইল ফার্মিং এবং আর্নিং বট।"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @router.message(F.text == "🎁 Daily Bonus")
 async def handle_daily_bonus(message: Message):
-    """ডেইলি বোনাস ক্লেইম করার হ্যান্ডলার"""
     success, msg, amount = await db.claim_daily_bonus(message.from_user.id)
     await message.answer(msg, parse_mode="HTML")
 
 @router.message(F.text == "📋 Tasks ▸")
 async def handle_tasks_menu(message: Message):
-    tasks_enabled = (await db.get_setting("tasks_enabled", "true")) == "true"
-    if not tasks_enabled:
-        await message.answer("⚠️ বর্তমান সময়ে টাস্ক সার্ভিস সাময়িকভাবে বন্ধ রয়েছে।")
+    categories = await db.get_categories()
+    keyboard_buttons = []
+    
+    for cat in categories:
+        if cat["is_enabled"]: # শুধুমাত্র চালু ক্যাটাগরিগুলোই ইউজারের সামনে দেখাবে
+            keyboard_buttons.append([InlineKeyboardButton(text=cat["category_name"], callback_data=f"cat_task_{cat['category_key']}")])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")])
+    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
+    if not keyboard_buttons or len(keyboard_buttons) <= 1:
+        await message.answer("⚠️ বর্তমানে সকল টাস্ক ক্যাটাগরি সাময়িকভাবে বন্ধ রয়েছে।")
         return
 
-    text = "🎯 <b>কাজের ক্যাটাগরি নির্বাচন করুন:</b>"
-    await message.answer(text, reply_markup=get_task_category_keyboard(), parse_mode="HTML")
+    await message.answer("🎯 <b>কাজের ক্যাটাগরি নির্বাচন করুন:</b>", reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "start_gmail_task")
-async def handle_gmail_task(callback: CallbackQuery, state: FSMContext):
-    tasks_enabled = (await db.get_setting("tasks_enabled", "true")) == "true"
-    if not tasks_enabled:
-        await callback.answer("⚠️ টাস্ক সার্ভিস বর্তমানে বন্ধ আছে।", show_alert=True)
-        return
+@router.callback_query(F.data.startswith("cat_task_"))
+async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
+    cat_key = callback.data.replace("cat_task_", "")
+    
+    if cat_key == "gmail":
+        try:
+            db_task = await db.get_available_task()
+            if db_task:
+                task = db_task
+            else:
+                task = task_manager.generate_random_gmail()
 
-    try:
-        db_task = await db.get_available_task()
-        if db_task:
-            task = db_task
-        else:
-            task = task_manager.generate_random_gmail()
+            await state.set_state(TaskStates.working_on_task)
+            await state.update_data(current_task=task)
 
-        await state.set_state(TaskStates.working_on_task)
-        await state.update_data(current_task=task)
+            first_name = task.get("first_name") or task['email'].split('@')[0].capitalize()
+            last_name = task.get("last_name") or "❌"
 
-        first_name = task.get("first_name") or task['email'].split('@')[0].capitalize()
-        last_name = task.get("last_name") or "❌"
-
-        text = (
-            "✏️ <b>নিচে দেওয়া তথ্য দিয়ে জিমেইল একাউন্ট তৈরি করুন:</b>\n\n"
-            f"👤 <b>First Name:</b> <code>{first_name}</code>\n"
-            f"👤 <b>Last Name:</b> <code>{last_name}</code>\n"
-            f"📧 <b>Email:</b> <code>{task['email']}</code>\n"
-            f"🔑 <b>Password:</b> <code>{task['password']}</code>\n\n"
-            "⚠️ <i>অবশ্যই হুবহু এই তথ্যগুলো ব্যবহার করবেন।</i>\n\n"
-            f"🛡️ <b>Recovery Email:</b>\n<code>{task['recovery']}</code>"
-        )
-        await callback.message.edit_text(text, reply_markup=get_task_action_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Error generating task: {e}")
-        await callback.message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে।")
+            text = (
+                "✏️ <b>নিচে দেওয়া তথ্য দিয়ে জিমেইল একাউন্ট তৈরি করুন:</b>\n\n"
+                f"👤 <b>First Name:</b> <code>{first_name}</code>\n"
+                f"👤 <b>Last Name:</b> <code>{last_name}</code>\n"
+                f"📧 <b>Email:</b> <code>{task['email']}</code>\n"
+                f"🔑 <b>Password:</b> <code>{task['password']}</code>\n\n"
+                f"🛡️ <b>Recovery Email:</b>\n<code>{task['recovery']}</code>"
+            )
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Verify Task", callback_data="verify_task")],
+                [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
+            ])
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error generating task: {e}")
+            await callback.message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে।")
+    else:
+        await callback.answer("⚠️ এই ক্যাটাগরির কাজ বর্তমানে স্টকে নেই।", show_alert=True)
 
 @router.callback_query(F.data == "cancel_task")
 async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
@@ -167,10 +162,14 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.message.edit_text("⚠️ টাস্ক কমপ্লিট করতে সমস্যা হয়েছে।")
     else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verify Task", callback_data="verify_task")],
+            [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
+        ])
         await callback.message.edit_text(
             "❌ <b>ভেরিফিকেশন ব্যর্থ হয়েছে!</b>\n\n"
             "গুগল থেকে রিকভারি মেইলে কনফার্মেশন মেসেজ আসেনি। আবার চেষ্টা করুন:",
-            reply_markup=get_task_action_keyboard(),
+            reply_markup=kb,
             parse_mode="HTML"
         )
         return
@@ -213,7 +212,7 @@ async def handle_referral(message: Message):
         f"ℹ️ You will receive <b>{comm_pct}% commission</b> on earnings from each task completed by your referrals."
     )
     
-    share_url = f"https://t.me/share/url?url={ref_link}&text=Join%20this%20amazing%20earning%20bot%20and%20start%20earning%20money!"
+    share_url = f"https://t.me/share/url?url={ref_link}&text=Join%20this%20amazing%20earning%20bot!"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Share Now", url=share_url)]
     ])
@@ -226,16 +225,16 @@ async def handle_support(message: Message):
         "যেকোনো প্রয়োজনে আমাদের সাপোর্ট টিমের সাথে যোগাযোগ করুন:\n"
         "👉 এডমিন সাপোর্ট: @AdminSupport"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, reply_npm:=None, parse_mode="HTML") # type: ignore
 
 @router.message(F.text == "💡 I am New")
 async def handle_iam_new(message: Message):
     text = (
         "💡 <b>নতুনদের জন্য নির্দেশিকা:</b>\n\n"
         "১. <b>Tasks ▸</b> থেকে জিমেইল টাস্ক নিন।\n"
-        "২. জিমেইল খোলার সময় রিকভারি মেইলে বোটের দেওয়া মেইলটি বসান।\n"
-        "৩. <b>Verify Task</b> এ ক্লিক করে ব্যালেন্স যোগ করুন।\n"
-        "৪. প্রতিদিন <b>Daily Bonus</b> দাবি করতে ভুলবেন না!"
+        "২. রিকভারি মেইলে বোটের দেওয়া মেইলটি বসান।\n"
+        "৩. <b>Verify Task</b> এ ক্লিক করুন।\n"
+        "৪. প্রতিদিন <b>Daily Bonus</b> দাবি করুন!"
     )
     await message.answer(text, parse_mode="HTML")
 
