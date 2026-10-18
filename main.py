@@ -25,15 +25,23 @@ class TaskStates(StatesGroup):
     working_on_task = State()
 
 def get_main_keyboard():
-    """মূল মেনু কিবোর্ড (উইথড্রো বাটন সহ)"""
+    """স্ক্রিনশটের আদলে প্রিমিয়াম মেইন মেনু কিবোর্ড"""
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Register a new Gmail")],
-            [KeyboardButton(text="👤 My Profile"), KeyboardButton(text="🔗 Referral Link")],
-            [KeyboardButton(text="💵 Withdraw")]
+            [KeyboardButton(text="📋 Tasks ▸"), KeyboardButton(text="💰 Balance")],
+            [KeyboardButton(text="💵 Withdraw"), KeyboardButton(text="🎁 My Referrals")],
+            [KeyboardButton(text="🎧 Support"), KeyboardButton(text="💡 I am New")]
         ],
         resize_keyboard=True
     )
+    return keyboard
+
+def get_task_category_keyboard():
+    """টাস্ক ক্যাটাগরি ইনলাইন কিবোর্ড"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📧 Gmail Tasks", callback_data="start_gmail_task")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")]
+    ])
     return keyboard
 
 def get_task_action_keyboard():
@@ -51,7 +59,6 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
 
-    # রেফারেল আইডি হ্যান্ডেল করা (/start <ref_id>)
     args = message.text.split()
     referred_by = None
     if len(args) > 1 and args[1].isdigit():
@@ -59,19 +66,34 @@ async def cmd_start(message: Message, state: FSMContext):
         if ref_id != user_id:
             referred_by = ref_id
 
-    # ইউজার ডাটাবেজে রেজিস্টার বা ফেচ করা
     await db.get_or_create_user(user_id=user_id, username=username, referred_by=referred_by)
 
     welcome_text = (
         f"👋 স্বাগতম <b>{message.from_user.first_name}</b>!\n\n"
-        "🤖 এটি আপনার অটোমেটেড জিমেইল ফার্মিং এবং টাস্ক আর্নিং বট।\n"
-        "নিচের বাটন থেকে নতুন টাস্ক নিয়ে কাজ শুরু করুন, রেফার করে কমিশন পান এবং সহজে উইথড্রো করুন!"
+        "🤖 এটি আপনার প্রিমিয়াম জিমেইল ফার্মিং এবং টাস্ক আর্নিং বট।\n"
+        "নিচের প্রিমিয়াম মেনু থেকে টাস্ক সম্পন্ন করুন, রেফার করে আয় করুন এবং সহজে উইথড্রো করুন!"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-@router.message(F.text == "➕ Register a new Gmail")
-async def handle_register_btn(message: Message, state: FSMContext):
-    """নতুন জিমেইল টাস্ক জেনারেট বা স্টক থেকে দেওয়া"""
+@router.message(F.text == "📋 Tasks ▸")
+async def handle_tasks_menu(message: Message):
+    """টাস্ক ক্যাটাগরি মেনু (এডমিন প্যানেল থেকে টাস্ক বন্ধ থাকলে চেক করবে)"""
+    tasks_enabled = (await db.get_setting("tasks_enabled", "true")) == "true"
+    if not tasks_enabled:
+        await message.answer("⚠️ বর্তমান সময়ে টাস্ক সার্ভিস সাময়িকভাবে বন্ধ রয়েছে। দয়া করে পরে চেষ্টা করুন।")
+        return
+
+    text = "🎯 <b>কাজের ক্যাটাগরি নির্বাচন করুন:</b>"
+    await message.answer(text, reply_markup=get_task_category_keyboard(), parse_mode="HTML")
+
+@router.callback_query(F.data == "start_gmail_task")
+async def handle_gmail_task(callback: CallbackQuery, state: FSMContext):
+    """জিমেইল টাস্ক জেনারেট বা স্টক থেকে দেওয়া"""
+    tasks_enabled = (await db.get_setting("tasks_enabled", "true")) == "true"
+    if not tasks_enabled:
+        await callback.answer("⚠️ টাস্ক সার্ভিস বর্তমানে বন্ধ আছে।", show_alert=True)
+        return
+
     try:
         db_task = await db.get_available_task()
         if db_task:
@@ -94,10 +116,10 @@ async def handle_register_btn(message: Message, state: FSMContext):
             "⚠️ <i>অবশ্যই হুবহু এই তথ্যগুলো ব্যবহার করবেন।</i>\n\n"
             f"🛡️ <b>Recovery Email:</b>\n<code>{task['recovery']}</code>"
         )
-        await message.answer(text, reply_markup=get_task_action_keyboard(), parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=get_task_action_keyboard(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error generating task: {e}")
-        await message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে। দয়া করে একটু পর আবার চেষ্টা করুন।")
+        await callback.message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে। দয়া করে একটু পর আবার চেষ্টা করুন।")
 
 @router.callback_query(F.data == "cancel_task")
 async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
@@ -120,7 +142,6 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     email = task["email"]
     await callback.message.edit_text("🔍 ইনবক্স চেক করা হচ্ছে... দয়া করে অপেক্ষা করুন ⏳")
 
-    # অটোমেটেড ইনবক্স চেকিং
     is_verified = await inbox_verifier.check_inbox(email)
 
     if is_verified:
@@ -148,34 +169,71 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-@router.message(F.text == "👤 My Profile")
-async def handle_profile(message: Message):
-    """ইউজার প্রোফাইল ও ব্যালেন্স চেক"""
+@router.message(F.text == "💰 Balance")
+async def handle_balance_btn(message: Message):
+    """ইউজার ব্যালেন্স ও সম্পন্ন টাস্ক ইনফো"""
     user_id = message.from_user.id
     user = await db.get_or_create_user(user_id, message.from_user.username or "")
     balance = user.get("balance", 0.0)
     completed = user.get("completed_tasks", 0)
 
     text = (
-        "👤 <b>আপনার প্রোফাইল:</b>\n\n"
+        "💰 <b>আপনার ব্যালেন্স একাউন্ট ইনফো:</b>\n\n"
         f"🆔 ইউজার আইডি: <code>{user_id}</code>\n"
-        f"💰 মূল ব্যালেন্স: <b>{balance} BDT</b>\n"
-        f"✅ সফল টাস্ক: <b>{completed} টি</b>"
+        f"💵 মূল ব্যালেন্স: <b>{balance} BDT</b>\n"
+        f"✅ সফল টাস্ক সম্পন্ন: <b>{completed} টি</b>"
     )
     await message.answer(text, parse_mode="HTML")
 
-@router.message(F.text == "🔗 Referral Link")
+@router.message(F.text == "🎁 My Referrals")
 async def handle_referral(message: Message):
-    """রেফারেল লিংক জেনারেট করা"""
+    """রেফারেল স্ট্যাটাস ও শেয়ার বাটন (স্ক্রিনশটের ডিজাইনে)"""
     user_id = message.from_user.id
+    user = await db.get_or_create_user(user_id, message.from_user.username or "")
+    
+    total_ref = user.get("referral_count", 0)
+    ref_income = user.get("referral_income", 0.0)
+    
     bot_info = await message.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    
+    comm_pct = await db.get_setting("referral_commission", "10.0")
 
     text = (
-        "🔗 <b>রেফারেল প্রোগ্রাম (১০% কমিশন):</b>\n\n"
-        "আপনার বন্ধুদের আমাদের বোটে আমন্ত্রণ জানান। তারা জিমেইল টাস্ক সম্পন্ন করে যে পেমেন্ট পাবে, তার ওপর আপনি আজীবন <b>১০% কমিশন</b> পাবেন!\n\n"
-        "আপনার রেফারেল লিংক:\n"
-        f"<code>{ref_link}</code>"
+        "🎁 <b>My Referrals</b>\n"
+        f"👥 Total Refer: <b>{total_ref}</b>\n"
+        f"💰 Total Refer Income: <b>{ref_income:.4f} BDT</b>\n"
+        f"🔗 <b>Your Referral Link:</b>\n<code>{ref_link}</code>\n\n"
+        f"ℹ️ You will receive <b>{comm_pct}% commission</b> on earnings from each task completed by your referrals."
+    )
+    
+    share_url = f"https://t.me/share/url?url={ref_link}&text=Join%20this%20amazing%20earning%20bot%20and%20start%20earning%20money!"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Share Now", url=share_url)]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@router.message(F.text == "🎧 Support")
+async def handle_support(message: Message):
+    """সাপোর্ট মেনু"""
+    text = (
+        "🎧 <b>সাপোর্ট ও হেল্প সেন্টার</b>\n\n"
+        "বট ব্যবহারে কোনো সমস্যা হলে বা পেমেন্ট সংক্রান্ত যেকোনো প্রয়োজনে আমাদের সাথে যোগাযোগ করুন:\n"
+        "👉 এডমিন সাপোর্ট: @AdminSupport\n"
+        "📖 কাজের নিয়মাবলী জানতে আমাদের ব্লগ ভিজিট করতে পারেন।"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+@router.message(F.text == "💡 I am New")
+async def handle_iam_new(message: Message):
+    """নতুনদের জন্য গাইডলাইন"""
+    text = (
+        "💡 <b>নতুনদের জন্য নির্দেশিকা:</b>\n\n"
+        "১. <b>Tasks ▸</b> এ ক্লিক করে জিমেইল টাস্ক নিন।\n"
+        "২. বোটের দেওয়া নাম ও পাসওয়ার্ড দিয়ে একটি নতুন জিমেইল অ্যাকাউন্ট খুলুন এবং রিকভারি মেইলে বোটের দেওয়া 1secmail বসান।\n"
+        "৩. অ্যাকাউন্ট খোলা শেষ হলে <b>Verify Task</b> এ ক্লিক করুন।\n"
+        "৪. ইনবক্স ভেরিফাই হওয়ার সাথে সাথে আপনার অ্যাকাউন্টে টাকা যোগ হয়ে যাবে!\n"
+        "৫. সর্বনিম্ন টাকা হলে <b>Withdraw</b> থেকে বিকাশ/নগদে তুলে নিন।"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -198,12 +256,12 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
 
-    # সমস্ত রাউটার রেজিস্টার করা (এডমিন, উইথড্রো এবং মেইন ইউজার)
+    # সমস্ত রাউটার রেজিস্টার করা
     dp.include_router(admin_router)
     dp.include_router(withdraw_router)
     dp.include_router(router)
 
-    # রেন্ডারের জন্য ব্যাকগ্রাউন্ড ওয়েব সার্ভার চালু করা
+    # ব্যাকগ্রাউন্ড ওয়েব সার্ভার চালু
     await start_web_server()
 
     logger.info("🚀 Starting bot polling...")
