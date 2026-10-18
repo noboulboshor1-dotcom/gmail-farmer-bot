@@ -14,7 +14,6 @@ class Database:
             raise e
 
     async def get_or_create_user(self, user_id: int, username: str, referred_by: int = None) -> dict:
-        """ইউজার ডেটাবেজে না থাকলে তৈরি করবে (রেফারেল আইডি সহ)"""
         try:
             res = self.supabase.table("users").select("*").eq("user_id", user_id).execute()
             if not res.data:
@@ -49,7 +48,6 @@ class Database:
             return None
 
     async def complete_task(self, task_id: int, user_id: int, reward: float) -> bool:
-        """টাস্ক কমপ্লিট হলে ইউজারকে টাকা দেওয়া এবং রেফারারকে ১০% কমিশন দেওয়া"""
         try:
             if task_id != 0:
                 self.supabase.table("tasks").update({
@@ -66,7 +64,7 @@ class Database:
                 "completed_tasks": new_completed
             }).eq("user_id", user_id).execute()
             
-            # রেফারেল কমিশন সিস্টেম (১০% কমিশন)
+            # ১০% রেফারেল কমিশন সিস্টেম
             referred_by = user.get("referred_by")
             if referred_by:
                 referrer_res = self.supabase.table("users").select("*").eq("user_id", referred_by).execute()
@@ -74,17 +72,76 @@ class Database:
                     referrer = referrer_res.data[0]
                     commission = reward * 0.10
                     new_ref_balance = float(referrer.get("balance", 0.0)) + commission
-                    
                     self.supabase.table("users").update({
                         "balance": new_ref_balance
                     }).eq("user_id", referred_by).execute()
-                    
-                    logger.info(f"Referrer {referred_by} got {commission} BDT commission from user {user_id}")
             
             return True
         except Exception as e:
             logger.error(f"Error completing task: {e}")
-            return false
+            return False
+
+    async def create_withdrawal(self, user_id: int, amount: float, method: str, account_no: str) -> bool:
+        """উইথড্রো রিকোয়েস্ট তৈরি করা এবং ইউজারের ব্যালেন্স কেটে নেওয়া"""
+        try:
+            user = await self.get_or_create_user(user_id, "")
+            current_balance = float(user.get("balance", 0.0))
+            
+            if current_balance < amount:
+                return False
+
+            # ব্যালেন্স থেকে টাকা কেটে নেওয়া
+            new_balance = current_balance - amount
+            self.supabase.table("users").update({"balance": new_balance}).eq("user_id", user_id).execute()
+
+            # উইথড্রো টেবিলে রিকোয়েস্ট সেভ করা
+            withdrawal_data = {
+                "user_id": user_id,
+                "amount": amount,
+                "method": method,
+                "account_no": account_no,
+                "status": "pending"
+            }
+            self.supabase.table("withdrawals").insert(withdrawal_data).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating withdrawal: {e}")
+            return False
+
+    async def get_pending_withdrawals(self) -> list:
+        """পেন্ডিং উইথড্রো রিকোয়েস্টগুলো ফেচ করা"""
+        try:
+            res = self.supabase.table("withdrawals").select("*").eq("status", "pending").execute()
+            return res.data if res.data else []
+        except Exception as e:
+            logger.error(f"Error fetching withdrawals: {e}")
+            return []
+
+    async def update_withdrawal_status(self, withdrawal_id: int, status: str) -> bool:
+        """উইথড্রো স্ট্যাটাস আপডেট (approved/rejected)"""
+        try:
+            res = self.supabase.table("withdrawals").select("*").eq("id", withdrawal_id).execute()
+            if not res.data:
+                return False
+            
+            req = res.data[0]
+            if req["status"] != "pending":
+                return False
+
+            self.supabase.table("withdrawals").update({"status": status}).eq("id", withdrawal_id).execute()
+
+            # যদি রিজেক্ট হয়, তবে ইউজারের টাকা আবার রিফান্ড করে দেওয়া
+            if status == "rejected":
+                user_id = req["user_id"]
+                amount = float(req["amount"])
+                user = await self.get_or_create_user(user_id, "")
+                refund_balance = float(user.get("balance", 0.0)) + amount
+                self.supabase.table("users").update({"balance": refund_balance}).eq("user_id", user_id).execute()
+
+            return True
+        except Exception as e:
+            logger.error(f"Error updating withdrawal status: {e}")
+            return False
 
     async def get_all_users_count(self) -> int:
         try:
