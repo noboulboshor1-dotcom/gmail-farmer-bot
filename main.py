@@ -4,6 +4,8 @@ import logging
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 
 from config import BOT_TOKEN
@@ -11,8 +13,8 @@ from keyboards import get_reply_main_menu, get_task_action_keyboard, get_back_bu
 from database import db
 from tasks import task_manager
 from admin import admin_router
+from verifier import check_recovery_email_received
 
-# প্রফেশনাল লগিং সেটআপ
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -21,10 +23,22 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+# ইউজারের একটিভ টাস্ক স্টোর করার জন্য State
+class TaskStates(StatesGroup):
+    working_on_task = State()
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     try:
-        await db.get_or_create_user(message.from_user.id, message.from_user.username or "NoUsername")
+        args = message.text.split()
+        referred_by = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+
+        await db.get_or_create_user(
+            message.from_user.id, 
+            message.from_user.username or "NoUsername", 
+            referred_by=referred_by
+        )
+        
         welcome_text = (
             "<b>Register Gmail accounts and get paid for it.</b>\n\n"
             "For each Normal account you will receive <b>0.15$</b> (or 10 BDT)\n"
@@ -37,16 +51,17 @@ async def cmd_start(message: Message):
         await message.answer("⚠️ একটি প্রযুক্তিগত ত্রুটি ঘটেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।")
 
 @router.message(F.text == "➕ Register a new Gmail")
-async def handle_register_btn(message: Message):
+async def handle_register_btn(message: Message, state: FSMContext):
     try:
-        # প্রথমে সুপাবেজ ডাটাবেজ স্টক থেকে টাস্ক খোঁজা
         db_task = await db.get_available_task()
-        
         if db_task:
             task = db_task
         else:
-            # স্টকে টাস্ক না থাকলে ফলব্যাক জেনারেটর ব্যবহার করা
             task = task_manager.generate_random_gmail()
+
+        # ইউজারের স্টেট ডাটাতে টাস্ক ইনফো সেভ রাখা
+        await state.set_state(TaskStates.working_on_task)
+        await state.update_data(current_task=task)
 
         text = (
             "✏️ <b>Register Gmail account using the specified data</b>\n\n"
@@ -61,6 +76,48 @@ async def handle_register_btn(message: Message):
     except Exception as e:
         logger.error(f"Error generating task: {e}")
         await message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে। দয়া করে একটু পর আবার চেষ্টা করুন।")
+
+@router.callback_query(F.data == "task_done")
+async def task_done_callback(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    user_data = await state.get_data()
+    task = user_data.get("current_task")
+
+    if not task:
+        await callback.answer("⚠️ আপনার কোনো সক্রিয় টাস্ক পাওয়া যায়নি! নতুন টাস্ক নিন।", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ <b>ভেরিফাই করা হচ্ছে... অনুগ্রহ করে ১০-১৫ সেকেন্ড অপেক্ষা করুন!</b>\n<i>গুগল থেকে রিকভারি মেইলে কনফার্মেশন পাঠানো হয়েছে কি না তা চেক করা হচ্ছে।</i>", parse_mode="HTML")
+
+    # অটোমেটিক ইনবক্স ভেরিফিকেশন সিস্টেম
+    is_verified = await check_recovery_email_received(task["recovery"])
+
+    if is_verified:
+        task_id = task.get("id", 0)
+        success = await db.complete_task(task_id=task_id, user_id=user_id, reward=10.0)
+        
+        if success:
+            await callback.message.edit_text(
+                "✅ <b>অভিনন্দন! আপনার জিমেইল তৈরি সফলভাবে ভেরিফাই হয়েছে।</b>\n\n💵 ১০ টাকা আপনার ব্যালেন্সে যোগ করা হয়েছে।",
+                parse_mode="HTML"
+            )
+            await state.clear()
+        else:
+            await callback.message.edit_text("⚠️ ডাটাবেজ অপাডেশনে ত্রুটি হয়েছে। এডমিনের সাথে যোগাযোগ করুন।", parse_mode="HTML")
+    else:
+        await callback.message.edit_text(
+            "❌ <b>কাজটি সঠিক হয়নি!</b>\n\n"
+            "আমরা রিকভারি মেইলে গুগলের কোনো কনফার্মেশন মেইল পাইনি।\n"
+            "দয়া করে নিশ্চিত করুন যে আপনি দেওয়া রিকভারি মেইলটি সঠিকভাবে যুক্ত করেছেন এবং আবার চেষ্টা করুন।",
+            reply_markup=get_task_action_keyboard(),
+            parse_mode="HTML"
+        )
+
+@router.callback_query(F.data == "task_cancel")
+async def task_cancel_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ টাস্কটি বাতিল করা হয়েছে। নতুন টাস্ক নিতে নিচের মেনু ব্যবহার করুন।", parse_mode="HTML")
+    await callback.answer()
 
 @router.message(F.text == "💰 My Balance")
 async def handle_balance_btn(message: Message):
@@ -84,8 +141,8 @@ async def handle_referral_btn(message: Message):
     bot_info = await message.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
     text = (
-        "👥 <b>রেফারেল প্রোগ্রাম:</b>\n\n"
-        "আপনার বন্ধুদের আমাদের বোটে আমন্ত্রণ জানান এবং প্রতি রেফারে আকর্ষণীয় বোনাস অর্জন করুন!\n\n"
+        "👥 <b>রেফারেল প্রোগ্রাম (১০% কমিশন):</b>\n\n"
+        "আপনার বন্ধুদের আমাদের বোটে আমন্ত্রণ জানান! আপনার রেফার করা কোনো ইউজার যখনই কোনো টাস্ক কমপ্লিট করবে, তার আয়ের **১০% কমিশন** আপনি লাইফটাইম পেতে থাকবেন!\n\n"
         f"🔗 আপনার রেফারেল লিংক:\n<code>{ref_link}</code>"
     )
     await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
@@ -94,49 +151,19 @@ async def handle_referral_btn(message: Message):
 async def handle_help_btn(message: Message):
     text = (
         "⚙️ <b>সাহায্য ও নিয়মাবলী:</b>\n\n"
-        "১. সঠিক তথ্য দিয়ে জিমেইল অ্যাকাউন্ট তৈরি করুন।\n"
-        "২. কাজ শেষ করে 'Done' বাটনে ক্লিক করুন।\n"
-        "৩. কোনো সমস্যা হলে এডমিনের সাথে যোগাযোগ করুন।"
+        "১. সঠিক তথ্য ও রিকভারি ইমেইল দিয়ে জিমেইল অ্যাকাউন্ট তৈরি করুন।\n"
+        "২. রিকভারি ইমেইল যোগ না করলে কাজটি অটো-ভেরিফাই হবে না।\n"
+        "৩. কাজ শেষ করে 'Done' বাটনে চাপলে অটো-ভেরিফিকেশন সম্পন্ন হবে।"
     )
     await message.answer(text, reply_markup=get_back_button(), parse_mode="HTML")
-
-@router.callback_query(F.data == "task_done")
-async def task_done_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    try:
-        user = await db.get_or_create_user(user_id, callback.from_user.username or "")
-        reward_amount = 10.0
-        
-        new_balance = float(user.get('balance', 0.0)) + reward_amount
-        new_tasks = int(user.get('completed_tasks', 0)) + 1
-        
-        await db.supabase.table("users").update({
-            "balance": new_balance, 
-            "completed_tasks": new_tasks
-        }).eq("user_id", user_id).execute()
-        
-        await callback.message.edit_text(
-            "✅ <b>অভিনন্দন! আপনার টাস্ক সফলভাবে জমা হয়েছে এবং ১০ টাকা আপনার ব্যালেন্সে যোগ করা হয়েছে।</b>",
-            parse_mode="HTML"
-        )
-        await callback.answer("টাস্ক সফল!")
-    except Exception as e:
-        logger.error(f"Error completing task callback: {e}")
-        await callback.answer("⚠️ টাস্ক সাবমিট করতে সমস্যা হয়েছে।", show_alert=True)
-
-@router.callback_query(F.data == "task_cancel")
-async def task_cancel_callback(callback: CallbackQuery):
-    await callback.message.edit_text("❌ টাস্কটি বাতিল করা হয়েছে। নতুন টাস্ক নিতে নিচের মেনু ব্যবহার করুন স্টক থেকে।", parse_mode="HTML")
-    await callback.answer()
 
 @router.callback_query(F.data == "main_menu")
 async def back_to_main_callback(callback: CallbackQuery):
     await callback.message.answer("🤖 প্রধান মেনুতে ফিরে এসেছেন:", reply_markup=get_reply_main_menu())
     await callback.answer()
 
-# Render Web Service-এর জন্য ব্যাকগ্রাউন্ড ডামি সার্ভার (24/7 সচল রাখার জন্য)
 async def handle(request):
-    return web.Response(text="Gmail Farmer Bot Pro is running 24/7!")
+    return web.Response(text="Gmail Farmer Bot Pro with Auto Verification is running 24/7!")
 
 async def start_dummy_server():
     app = web.Application()
@@ -152,11 +179,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     
-    # প্রথমে এডমিন রাউটার এবং তারপর সাধারণ ইউজার রাউটার রেজিস্টার করা
     dp.include_router(admin_router)
     dp.include_router(router)
     
-    # ব্যাকগ্রাউন্ডে ডামি ওয়েব সার্ভার চালু রাখা
     asyncio.create_task(start_dummy_server())
     
     logger.info("Starting bot polling...")
