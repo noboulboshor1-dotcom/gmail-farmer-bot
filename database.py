@@ -14,7 +14,7 @@ class Database:
             logger.error(f"❌ Supabase connection failed: {e}")
             raise e
 
-    # --- SETTINGS MANAGEMENT ---
+    # --- SETTINGS & CATEGORIES ---
     async def get_setting(self, key: str, default_value: str = "") -> str:
         try:
             res = self.supabase.table("settings").select("value").eq("key", key).execute()
@@ -33,6 +33,27 @@ class Database:
             logger.error(f"Error updating setting {key}: {e}")
             return False
 
+    async def get_categories(self) -> list:
+        try:
+            res = self.supabase.table("task_categories").select("*").execute()
+            return res.data if res.data else []
+        except Exception as e:
+            logger.error(f"Error fetching categories: {e}")
+            return []
+
+    async def toggle_category(self, cat_key: str) -> bool:
+        try:
+            res = self.supabase.table("task_categories").select("is_enabled").eq("category_key", cat_key).execute()
+            if res.data:
+                current = res.data[0]["is_enabled"]
+                new_val = not current
+                self.supabase.table("task_categories").update({"is_enabled": new_val}).eq("category_key", cat_key).execute()
+                return new_val
+            return False
+        except Exception as e:
+            logger.error(f"Error toggling category: {e}")
+            return False
+
     # --- USER MANAGEMENT ---
     async def get_or_create_user(self, user_id: int, username: str, referred_by: int = None) -> dict:
         try:
@@ -40,7 +61,7 @@ class Database:
             if not res.data:
                 user_data = {
                     "user_id": user_id,
-                    "username": username,
+                    "username": username or f"User_{user_id}",
                     "balance": 0.0,
                     "completed_tasks": 0,
                     "referred_by": referred_by if referred_by != user_id else None,
@@ -60,10 +81,19 @@ class Database:
             return res.data[0]
         except Exception as e:
             logger.error(f"Error in get_or_create_user: {e}")
-            return {"user_id": user_id, "balance": 0.0, "completed_tasks": 0, "referral_count": 0, "referral_income": 0.0, "is_banned": False}
+            return {"user_id": user_id, "balance": 0.0, "completed_tasks": 0, "is_banned": False}
+
+    async def get_users_paginated(self, page: int = 1, limit: int = 6) -> list:
+        start = (page - 1) * limit
+        end = start + limit - 1
+        try:
+            res = self.supabase.table("users").select("user_id, username, balance, is_banned, completed_tasks").range(start, end).execute()
+            return res.data if res.data else []
+        except Exception as e:
+            logger.error(f"Error fetching paginated users: {e}")
+            return []
 
     async def claim_daily_bonus(self, user_id: int) -> tuple[bool, str, float]:
-        """ডেইলি বোনাস দাবি করার লজিক"""
         try:
             user = await self.get_or_create_user(user_id, "")
             today_str = date.today().isoformat()
@@ -85,7 +115,6 @@ class Database:
             return False, "⚠️ বোনাস ক্লেইম করতে সমস্যা হয়েছে।", 0.0
 
     async def get_all_user_ids(self) -> list:
-        """ব্রডকাস্টিংয়ের জন্য সমস্ত ইউজারের আইডি আনা"""
         try:
             res = self.supabase.table("users").select("user_id").execute()
             return [r["user_id"] for r in res.data] if res.data else []
@@ -94,7 +123,6 @@ class Database:
             return []
 
     async def set_user_ban_status(self, user_id: int, ban: bool) -> bool:
-        """ইউজার ব্যান বা আনব্যান করা"""
         try:
             self.supabase.table("users").update({"is_banned": ban}).eq("user_id", user_id).execute()
             return True
