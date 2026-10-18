@@ -1,28 +1,32 @@
-import aiohttp
 import logging
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
-async def check_recovery_email_received(recovery_email: str) -> bool:
-    """
-    গুগল থেকে রিকভারি ইনবক্সে নোটিফিকেশন মেইল এসেছে কি না চেক করা
-    """
-    try:
-        if "@" not in recovery_email:
-            return False
+class InboxVerifier:
+    def __init__(self):
+        self.base_url = "https://www.1secmail.com/api/v1/"
+
+    async def check_inbox(self, email: str) -> bool:
+        """ইমেইলের ইনবক্স চেক করে ভেরিফিকেশন মেইল এসেছে কি না তা নিশ্চিত করা"""
+        try:
+            if "@" not in email:
+                return False
             
-        username, domain = recovery_email.split("@")
-        url = f"https://www.1secmail.com/api/v1/?action=getMessages&login={username}&domain={domain}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    messages = await response.json()
-                    # ইনবক্সে কোনো মেইল এসেছে কি না তা পরীক্ষা করা
-                    if len(messages) > 0:
-                        logger.info(f"Verification success for {recovery_email}")
-                        return True
-        return False
-    except Exception as e:
-        logger.error(f"Verification error for {recovery_email}: {e}")
-        return False
+            login, domain = email.split("@")
+            url = f"{self.base_url}?action=getMessages&login={login}&domain={domain}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        messages = await response.json()
+                        if messages and len(messages) > 0:
+                            logger.info(f"✅ Email verification success for {email}")
+                            return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking inbox for {email}: {e}")
+            return False
+
+# main.py যে নামটি দিয়ে ইম্পোর্ট করছে সেটি সঠিকভাবে তৈরি করা হলো
+inbox_verifier = InboxVerifier()
