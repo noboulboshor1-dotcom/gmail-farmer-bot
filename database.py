@@ -54,11 +54,12 @@ class Database:
             logger.error(f"Error toggling category: {e}")
             return False
 
-    # --- USER MANAGEMENT ---
+    # --- SMART USER MANAGEMENT (स्मार्ट রেফারেল হ্যান্ডলিং) ---
     async def get_or_create_user(self, user_id: int, username: str, referred_by: int = None) -> dict:
         try:
             res = self.supabase.table("users").select("*").eq("user_id", user_id).execute()
             if not res.data:
+                # একদম নতুন ইউজার হলে ডাটাবেজে ইনসার্ট হবে
                 user_data = {
                     "user_id": user_id,
                     "username": username or f"User_{user_id}",
@@ -71,6 +72,7 @@ class Database:
                 }
                 inserted = self.supabase.table("users").insert(user_data).execute()
                 
+                # যদি রেফারার থাকে, তবে তার রেফার কাউন্ট বাড়িয়ে দেওয়া
                 if referred_by and referred_by != user_id:
                     ref_res = self.supabase.table("users").select("referral_count").eq("user_id", referred_by).execute()
                     if ref_res.data:
@@ -78,7 +80,22 @@ class Database:
                         self.supabase.table("users").update({"referral_count": current_count + 1}).eq("user_id", referred_by).execute()
 
                 return inserted.data[0] if inserted.data else user_data
-            return res.data[0]
+            else:
+                # ইউজার যদি আগে থেকেই থাকে কিন্তু তার কোনো `referred_by` না থাকে এবং সে এখন নতুন কোনো রেফারেল লিংকে ক্লিক করে
+                user = res.data[0]
+                if not user.get("referred_by") and referred_by and referred_by != user_id:
+                    # নিজের নিজেকে রেফার করতে পারবে না
+                    self.supabase.table("users").update({"referred_by": referred_by}).eq("user_id", user_id).execute()
+                    
+                    # রেফারারের কাউন্ট আপডেট করা
+                    ref_res = self.supabase.table("users").select("referral_count").eq("user_id", referred_by).execute()
+                    if ref_res.data:
+                        current_count = int(ref_res.data[0].get("referral_count", 0))
+                        self.supabase.table("users").update({"referral_count": current_count + 1}).eq("user_id", referred_by).execute()
+                        
+                    user["referred_by"] = referred_by
+                
+                return user
         except Exception as e:
             logger.error(f"Error in get_or_create_user: {e}")
             return {"user_id": user_id, "balance": 0.0, "completed_tasks": 0, "is_banned": False}
