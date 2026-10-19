@@ -67,3 +67,9 @@ VERIFY_REQUIRE_ADDRESS = _env_bool("VERIFY_REQUIRE_ADDRESS", True)
 FB_FIRST_NAME = os.getenv("FB_FIRST_NAME", "Sem")
 FB_LAST_NAME = os.getenv("FB_LAST_NAME", "De Jong")
 FB_PASSWORD = os.getenv("FB_PASSWORD", "nbbd@18")
+# ক্যাটাগরিভিত্তিক ফিক্সড রিওয়ার্ড (টাকা বা পয়েন্ট)
+CATEGORY_REWARDS = {
+    "gmail": 10.00,      # জিমেইল টাস্কের জন্য নির্দিষ্ট অ্যামাউন্ট
+    "facebook": 4.00,    # ফেসবুক টাস্কের জন্য নির্দিষ্ট অ্যামাউন্ট
+    "instagram": 5.00    # ইনস্টাগ্রাম টাস্কের জন্য নির্দিষ্ট অ্যামাউন্ট
+}
