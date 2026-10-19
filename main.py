@@ -29,6 +29,7 @@ from config import (
     PORT,
     SUPPORT_USERNAME,
     TASK_STALE_MINUTES,
+    CATEGORY_REWARDS
 )
 from database import db
 from keyboards import (
@@ -224,6 +225,7 @@ def _gmail_task_text(task: dict) -> str:
         f"📧 <b>Email:</b> <code>{html.escape(task['email'])}</code>\n"
         f"🔑 <b>Password:</b> <code>{html.escape(task['password'])}</code>\n\n"
         f"🛡️ <b>Recovery Email:</b>\n<code>{html.escape(task['recovery'])}</code>"
+        f"💰 <b>রিওয়ার্ড:</b> <code>{reward_amount:.2f} BDT</code>"
     )
 
 
@@ -245,6 +247,7 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("⚠️ সঠিকভাবে কাজটি সম্পাদন করুন!", reply_markup=get_cancel_keyboard())
 
     elif cat_key == "facebook":
+        fb_reward = CATEGORY_REWARDS["facebook"]
         await state.set_state(TaskStates.waiting_for_fb_uid)
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Send UID", callback_data="prompt_fb_uid")]])
         await safe_edit(
@@ -258,6 +261,7 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("⚠️ ইউআইডি টাইপ করে পাঠাতে পারেন অথবা নিচে ক্যানসেল করতে পারেন:", reply_markup=get_cancel_keyboard())
 
     elif cat_key == "instagram":
+        insta_reward = CATEGORY_REWARDS["instagram"]
         await state.set_state(TaskStates.waiting_for_insta_2fa)
         await safe_edit(callback.message, "🔑 <b>Enter 2FA Key:</b> ⤵️")
         await callback.message.answer("⚠️ আপনার 2FA Key পেস্ট করে সেন্ড করুন:", reply_markup=get_cancel_keyboard())
