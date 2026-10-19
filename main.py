@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 router = Router(name="user")
-_verifying: set[int] = set()          # users with a verification currently running
+_verifying: set[int] = set()
 
 
 class TaskStates(StatesGroup):
@@ -75,7 +75,6 @@ def _fmt(x) -> str:
 
 
 def parse_credentials(stock_string):
-    """ইউজারনেম ও পাসওয়ার্ড আলাদা করার হেল্পার ফাংশন"""
     if ":" in stock_string:
         u, p = stock_string.split(":", 1)
         return u.strip(), p.strip()
@@ -126,7 +125,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await message.answer(
         f"🌟 <b>স্বাগতম, {html.escape(message.from_user.first_name)}!</b>\n\n"
         "🚀 <b>পেশাদার মাইক্রো-টাস্ক ও আর্নিং প্ল্যাটফর্মে আপনাকে স্বাগতম।</b>\n"
-        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন。\n\n"
+        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন।\n\n"
         "📌 <b>মূল বৈশিষ্ট্যসমূহ:</b>\n"
         "▪️ দ্রুত ও অটোমেটেড জিমেইল ভেরিফিকেশন\n"
         "▪️ ইনস্ট্যান্ট ডেইলি বোনাস ও রেফারেল কমিশন\n"
@@ -205,7 +204,7 @@ async def handle_iam_new(message: Message):
 
 
 # ----------------------------------------------------------------------------
-# ADMIN TEXT-BASED BULK STOCK UPLOAD (/addstock)
+# ADMIN BULK STOCK UPLOAD (/addstock)
 # ----------------------------------------------------------------------------
 @router.message(Command("addstock"))
 async def handle_addstock_start(message: Message, command: CommandObject, state: FSMContext):
@@ -311,20 +310,22 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("⚠️ সঠিকভাবে কাজটি সম্পাদন করুন!", reply_markup=get_cancel_keyboard())
 
     elif cat_key == "facebook":
+        fb_reward = CATEGORY_REWARDS.get("facebook", 4.0)
         await state.set_state(TaskStates.waiting_for_fb_uid)
-        fb_reward = CATEGORY_REWARDS.get("facebook", 0.04)
-        text = (
-            "📘 <b>Facebook Account Task</b>\n\n"
-            "📌 <b>নির্দেশনা:</b>\n"
-            "১. যেকোনো সচল ফেসবুক একাউন্ট ব্যবহার করুন।\n"
-            "২. একাউন্ট থেকে আপনার <b>UID</b> এবং <b>Cookies</b> সংগ্রহ করুন।\n"
-            "৩. নিচে <b>Send UID</b> বাটনে ক্লিক করে তথ্য সাবমিট করুন।\n\n"
-            f"💰 <b>রিওয়ার্ড:</b> <code>{fb_reward:.2f} BDT</code>"
-        )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Send UID", callback_data="prompt_fb_uid")],
             [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
         ])
+        
+        # ইউজারকে First Name, Last Name, Password প্রদর্শন করা
+        text = (
+            "📘 <b>Facebook Account Task</b>\n\n"
+            f"👤 <b>First Name:</b> <code>{html.escape(FB_FIRST_NAME)}</code>\n"
+            f"👤 <b>Last Name:</b> <code>{html.escape(FB_LAST_NAME)}</code>\n"
+            f"🔑 <b>Password:</b> <code>{html.escape(FB_PASSWORD)}</code>\n\n"
+            f"💰 <b>রিওয়ার্ড:</b> <code>{fb_reward:.2f} BDT</code>\n\n"
+            "📌 ওপরের তথ্য দিয়ে ফেসবুক একাউন্ট তৈরি করে নিচে <b>Send UID</b> বাটনে ক্লিক করুন:"
+        )
         await safe_edit(callback.message, text, kb)
         await callback.message.answer("⚠️ ইউআইডি টাইপ করে পাঠাতে পারেন অথবা নিচে ক্যানসেল করতে পারেন:", reply_markup=get_cancel_keyboard())
 
@@ -339,7 +340,7 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskStates.waiting_for_insta_2fa)
         await state.update_data(insta_user=username, insta_pass=password)
 
-        insta_reward = CATEGORY_REWARDS.get("instagram", 0.05)
+        insta_reward = CATEGORY_REWARDS.get("instagram", 5.0)
         text = (
             "📸 <b>Instagram Account Task</b>\n\n"
             f"👤 <b>Username:</b> <code>{username}</code>\n"
@@ -481,7 +482,7 @@ async def process_fb_cookies_submission(message: Message, state: FSMContext):
         f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
         f"🏷️ <b>UID:</b> <code>{fb_uid}</code>\n"
         f"🍪 <b>Cookies:</b> <code>{cookies_text[:40]}...</code>\n"
-        f"💰 <b>Reward:</b> <code>{CATEGORY_REWARDS.get('facebook', 0.04):.2f} BDT</code>"
+        f"💰 <b>Reward:</b> <code>{CATEGORY_REWARDS.get('facebook', 4.0):.2f} BDT</code>"
     )
     for admin_id in ADMIN_IDS:
         try:
@@ -532,7 +533,7 @@ async def process_insta_2fa_submission(message: Message, state: FSMContext):
         f"🏷️ <b>Username:</b> <code>{username}</code>\n"
         f"🔐 <b>Password:</b> <code>{password}</code>\n"
         f"🔑 <b>2FA Key:</b> <code>{key_text}</code>\n"
-        f"💰 <b>Reward:</b> <code>{CATEGORY_REWARDS.get('instagram', 0.05):.2f} BDT</code>"
+        f"💰 <b>Reward:</b> <code>{CATEGORY_REWARDS.get('instagram', 5.0):.2f} BDT</code>"
     )
     for admin_id in ADMIN_IDS:
         try:
@@ -550,7 +551,7 @@ async def handle_accept_submission(callback: CallbackQuery):
     sub_id = parts[2]
     user_id = int(parts[3])
     cat_type = parts[4]
-    reward = CATEGORY_REWARDS.get("facebook", 0.04) if cat_type == "fb" else CATEGORY_REWARDS.get("instagram", 0.05)
+    reward = CATEGORY_REWARDS.get("facebook", 4.0) if cat_type == "fb" else CATEGORY_REWARDS.get("instagram", 5.0)
 
     await db.update_submission_status(sub_id, "accepted")
     await db.add_user_balance(user_id, reward)
