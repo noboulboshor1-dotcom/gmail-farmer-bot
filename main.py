@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 class TaskStates(StatesGroup):
-    working_on_task = State()
+    working_on_gmail = State()
+    waiting_for_fb_uid = State()
+    waiting_for_fb_cookies = State()
+    waiting_for_insta_2fa = State()
 
 @router.message.outer_middleware()
 async def check_banned_user(handler, event, data):
@@ -45,6 +48,15 @@ def get_main_keyboard():
     )
     return keyboard
 
+def get_cancel_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="❌ Cancel")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -62,14 +74,19 @@ async def cmd_start(message: Message, state: FSMContext):
 
     welcome_text = (
         f"👋 স্বাগতম <b>{message.from_user.first_name}</b>!\n\n"
-        "🤖 এটি আপনার প্রিমিয়াম জিমেইল ফার্মিং এবং আর্নিং বট।"
+        "🤖 এটি আপনার অল-ইন-ওয়ান প্রিমিয়াম ফার্মিং এবং আর্নিং বট।"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+@router.message(F.text == "❌ Cancel")
+async def handle_cancel_button(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ কাজ বাতিল করা হয়েছে।", reply_markup=get_main_keyboard())
 
 @router.message(F.text == "🎁 Daily Bonus")
 async def handle_daily_bonus(message: Message):
     success, msg, amount = await db.claim_daily_bonus(message.from_user.id)
-    await message.answer(msg, parse_mode="HTML")
+    await message.answer(msg, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @router.message(F.text == "📋 Tasks ▸")
 async def handle_tasks_menu(message: Message):
@@ -77,14 +94,14 @@ async def handle_tasks_menu(message: Message):
     keyboard_buttons = []
     
     for cat in categories:
-        if cat["is_enabled"]: # শুধুমাত্র চালু ক্যাটাগরিগুলোই ইউজারের সামনে দেখাবে
+        if cat["is_enabled"]:
             keyboard_buttons.append([InlineKeyboardButton(text=cat["category_name"], callback_data=f"cat_task_{cat['category_key']}")])
     
     keyboard_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")])
     kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
 
     if not keyboard_buttons or len(keyboard_buttons) <= 1:
-        await message.answer("⚠️ বর্তমানে সকল টাস্ক ক্যাটাগরি সাময়িকভাবে বন্ধ রয়েছে।")
+        await message.answer("⚠️ বর্তমানে সকল টাস্ক ক্যাটাগরি সাময়িকভাবে বন্ধ রয়েছে。", reply_markup=get_main_keyboard())
         return
 
     await message.answer("🎯 <b>কাজের ক্যাটাগরি নির্বাচন করুন:</b>", reply_markup=kb, parse_mode="HTML")
@@ -96,12 +113,9 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
     if cat_key == "gmail":
         try:
             db_task = await db.get_available_task()
-            if db_task:
-                task = db_task
-            else:
-                task = task_manager.generate_random_gmail()
+            task = db_task if db_task else task_manager.generate_random_gmail()
 
-            await state.set_state(TaskStates.working_on_task)
+            await state.set_state(TaskStates.working_on_gmail)
             await state.update_data(current_task=task)
 
             first_name = task.get("first_name") or task['email'].split('@')[0].capitalize()
@@ -121,19 +135,118 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
             ])
             await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await callback.message.answer("⚠️ কাজ চলাকালীন যেকোনো সময় নিচে '❌ Cancel' চাপুন:", reply_markup=get_cancel_keyboard())
         except Exception as e:
             logger.error(f"Error generating task: {e}")
-            await callback.message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে।")
+            await callback.message.answer("⚠️ টাস্ক লোড করতে সমস্যা হয়েছে।", reply_markup=get_main_keyboard())
+
+    elif cat_key == "facebook":
+        await state.set_state(TaskStates.waiting_for_fb_uid)
+        text = (
+            "👤 <b>First name:</b> Sem\n"
+            "👤 <b>Last name:</b> De Jong\n"
+            "🔑 <b>Password:</b> nbbd@18\n\n"
+            "📘 Create an account with the information above and click <b>Send UID</b> below:"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Send UID", callback_data="prompt_fb_uid")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.message.answer("⚠️ ইউআইডি টাইপ করে পাঠাতে পারেন অথবা নিচে ক্যানসেল করতে পারেন:", reply_markup=get_cancel_keyboard())
+
+    elif cat_key == "instagram":
+        await state.set_state(TaskStates.waiting_for_insta_2fa)
+        text = "🔑 <b>Enter 2FA Key:</b> ⤵️"
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.message.answer("⚠️ আপনার 2FA Key পেস্ট করে সেন্ড করুন:", reply_markup=get_cancel_keyboard())
+
     else:
         await callback.answer("⚠️ এই ক্যাটাগরির কাজ বর্তমানে স্টকে নেই।", show_alert=True)
+
+@router.callback_query(F.data == "prompt_fb_uid")
+async def handle_prompt_fb_uid(callback: CallbackQuery):
+    await callback.message.answer("🏷️ <b>Enter your Facebook account 14-16 digit UID:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@router.message(TaskStates.waiting_for_fb_uid)
+async def process_fb_uid_submission(message: Message, state: FSMContext):
+    uid_text = message.text.strip()
+    if uid_text.isdigit() and len(uid_text) >= 10:
+        await state.update_data(fb_uid=uid_text)
+        await state.set_state(TaskStates.waiting_for_fb_cookies)
+        await message.answer("📘 <b>Now enter your Facebook account Cookies:</b>", parse_mode="HTML", reply_markup=get_cancel_keyboard())
+    else:
+        await message.answer("⚠️ সঠিক 14-16 ডিজিটের Facebook UID দিন।", reply_markup=get_cancel_keyboard())
+
+@router.message(TaskStates.waiting_for_fb_cookies)
+async def process_fb_cookies_submission(message: Message, state: FSMContext):
+    cookies_text = message.text.strip()
+    if len(cookies_text) > 10:
+        data = await state.get_data()
+        fb_uid = data.get("fb_uid")
+        
+        try:
+            db.supabase.table("user_submissions").insert({
+                "user_id": message.from_user.id,
+                "category": "facebook",
+                "submission_data": f"UID: {fb_uid} | Cookies: {cookies_text}",
+                "status": "pending"
+            }).execute()
+        except Exception as e:
+            logger.error(f"Error saving FB submission: {e}")
+
+        await state.clear()
+        await message.answer(
+            "✅ <b>Submitted successfully!</b>\n\n"
+            "Your Facebook Account has been submitted to the buyer. Payment will be credited once verified.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("⚠️ <b>Invalid Cookies!</b> Please paste complete cookies.", parse_mode="HTML", reply_markup=get_cancel_keyboard())
+
+@router.message(TaskStates.waiting_for_insta_2fa)
+async def process_insta_2fa_submission(message: Message, state: FSMContext):
+    key_text = message.text.strip()
+    if len(key_text) >= 8:
+        try:
+            db.supabase.table("user_submissions").insert({
+                "user_id": message.from_user.id,
+                "category": "instagram",
+                "submission_data": f"2FA Key: {key_text}",
+                "status": "pending"
+            }).execute()
+        except Exception as e:
+            logger.error(f"Error saving Insta submission: {e}")
+
+        fake_code = "164226"
+        text = (
+            "Click the button below after opening account:\n"
+            "Click the button below to copy the code ⤵️\n\n"
+            f"📋 <code>{fake_code}</code>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Account Created", callback_data="insta_created_confirm")]
+        ])
+        await message.answer(text, reply_markup=kb, parse_mode="HTML", reply_markup_remove=True)
+        await state.clear()
+    else:
+        await message.answer("⚠️ সঠিক 2FA Key প্রদান করুন।", reply_markup=get_cancel_keyboard())
+
+@router.callback_query(F.data == "insta_created_confirm")
+async def handle_insta_confirm(callback: CallbackQuery):
+    await callback.message.edit_text("⏳ <b>Payment will be processed within 2 to 72 hours.</b>", parse_mode="HTML")
+    await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
+    await callback.answer()
 
 @router.callback_query(F.data == "cancel_task")
 async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ টাস্কটি বাতিল করা হয়েছে।")
+    await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
     await callback.answer()
 
-@router.callback_query(TaskStates.working_on_task, F.data == "verify_task")
+@router.callback_query(TaskStates.working_on_gmail, F.data == "verify_task")
 async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     task = data.get("current_task")
@@ -159,8 +272,10 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
                 f"💰 ব্যালেন্সে যোগ হয়েছে: <b>+{reward} BDT</b>",
                 parse_mode="HTML"
             )
+            await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
         else:
             await callback.message.edit_text("⚠️ টাস্ক কমপ্লিট করতে সমস্যা হয়েছে।")
+            await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Verify Task", callback_data="verify_task")],
@@ -189,7 +304,7 @@ async def handle_balance_btn(message: Message):
         f"💵 মূল ব্যালেন্স: <b>{balance} BDT</b>\n"
         f"✅ সফল টাস্ক সম্পন্ন: <b>{completed} টি</b>"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @router.message(F.text == "🎁 My Referrals")
 async def handle_referral(message: Message):
@@ -225,18 +340,18 @@ async def handle_support(message: Message):
         "যেকোনো প্রয়োজনে আমাদের সাপোর্ট টিমের সাথে যোগাযোগ করুন:\n"
         "👉 এডমিন সাপোর্ট: @AdminSupport"
     )
-    await message.answer(text, reply_npm:=None, parse_mode="HTML") # type: ignore
+    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @router.message(F.text == "💡 I am New")
 async def handle_iam_new(message: Message):
     text = (
         "💡 <b>নতুনদের জন্য নির্দেশিকা:</b>\n\n"
-        "১. <b>Tasks ▸</b> থেকে জিমেইল টাস্ক নিন।\n"
-        "২. রিকভারি মেইলে বোটের দেওয়া মেইলটি বসান।\n"
-        "৩. <b>Verify Task</b> এ ক্লিক করুন।\n"
+        "১. <b>Tasks ▸</b> থেকে পছন্দের টাস্ক নিন।\n"
+        "২. জিমেইল টাস্কে রিকভারি মেইল বসিয়ে অটোভেরিফাই করুন।\n"
+        "৩. ফেসবুক ও ইনস্টাগ্রাম টাস্কে আইডি/2FA কী সাবমিট করুন।\n"
         "৪. প্রতিদিন <b>Daily Bonus</b> দাবি করুন!"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_web(request):
     return web.Response(text="Super Premium Farmer Bot Live! 🚀")
