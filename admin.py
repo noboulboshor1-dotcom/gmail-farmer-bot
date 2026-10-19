@@ -50,9 +50,15 @@ async def cmd_admin(message: Message):
         "নিচের অপশনগুলো থেকে আপনার পছন্দ নির্বাচন করুন:"
     )
     kb = await get_admin_keyboard()
-    # এডমিন প্যানেলে প্রবেশ করলে নিচের ইউজার কিবোর্ড সরিয়ে ফেলা হবে
+    
+    # নীরবে ইউজার কিবোর্ড রিমুভ করার জন্য ট্রিক (কোনো বাড়তি টেক্সট দেখাবে না)
+    try:
+        temp = await message.answer("...", reply_markup=ReplyKeyboardRemove())
+        await temp.delete()
+    except Exception:
+        pass
+
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await message.answer("🛠️ এডমিন মোড সক্রিয়। ইউজার কিবোর্ড সাময়িকভাবে লুকানো হলো।", reply_markup=ReplyKeyboardRemove())
 
 # --- CATEGORY MANAGEMENT ---
 @admin_router.callback_query(F.data == "admin_categories")
@@ -285,7 +291,6 @@ async def handle_admin_back(callback: CallbackQuery):
     kb = await get_admin_keyboard()
     from main import get_main_keyboard
     await callback.message.edit_text("👑 <b>এডমিন কন্ট্রোল প্যানেল</b>", reply_markup=kb, parse_mode="HTML")
-    # এডমিন প্যানেল থেকে ব্যাক করলে মূল ইউজার কিবোর্ড ফিরিয়ে দেওয়া হবে
     await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
 
 @admin_router.callback_query(F.data == "admin_withdrawals")
@@ -295,7 +300,7 @@ async def handle_admin_withdrawals(callback: CallbackQuery):
 
     withdrawals = await db.get_pending_withdrawals()
     if not withdrawals:
-        await callback.answer("⚠️ বর্তমানে কোনো পেন্ডিং উইথড্রো রিকোয়েস্ট নেইলো।", show_alert=True)
+        await callback.answer("⚠️ বর্তমানে কোনো পেন্ডিং উইথড্রো রিকোয়েস্ট নেই।", show_alert=True)
         return
 
     await callback.message.edit_text("💳 <b>পেন্ডিং উইথড্রো রিকোয়েস্টসমূহ:</b>", parse_mode="HTML")
@@ -371,7 +376,6 @@ async def handle_withdrawal_action(callback: CallbackQuery):
         else:
             msg = "❌ উইথড্রো রিজেক্ট এবং টাকা রিফান্ড করা হয়েছে।"
             
-            # রিজেক্ট হলে ইউজারের ব্যালেন্সে টাকা রিফান্ড করা
             try:
                 user = await db.get_or_create_user(user_id, "")
                 current_bal = float(user.get("balance", 0.0))
@@ -380,7 +384,6 @@ async def handle_withdrawal_action(callback: CallbackQuery):
             except Exception as e:
                 logger.error(f"Error refunding balance: {e}")
 
-            # ইউজারের ইনবক্সে রিজেক্ট ও রিফান্ড মেসেজ পাঠানো
             try:
                 await callback.bot.send_message(
                     chat_id=user_id,
