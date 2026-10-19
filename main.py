@@ -63,7 +63,11 @@ class TaskStates(StatesGroup):
     waiting_for_fb_uid = State()
     waiting_for_fb_cookies = State()
     waiting_for_insta_2fa = State()
-    waiting_for_reject_reason = State()  # এডমিন রিজেক্টের কারণ ইনপুটের জন্য
+    waiting_for_reject_reason = State()
+
+
+class AdminStates(StatesGroup):
+    waiting_for_stock_data = State()
 
 
 def _fmt(x) -> str:
@@ -122,7 +126,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await message.answer(
         f"🌟 <b>স্বাগতম, {html.escape(message.from_user.first_name)}!</b>\n\n"
         "🚀 <b>পেশাদার মাইক্রো-টাস্ক ও আর্নিং প্ল্যাটফর্মে আপনাকে স্বাগতম।</b>\n"
-        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন।\n\n"
+        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন。\n\n"
         "📌 <b>মূল বৈশিষ্ট্যসমূহ:</b>\n"
         "▪️ দ্রুত ও অটোমেটেড জিমেইল ভেরিফিকেশন\n"
         "▪️ ইনস্ট্যান্ট ডেইলি বোনাস ও রেফারেল কমিশন\n"
@@ -201,43 +205,58 @@ async def handle_iam_new(message: Message):
 
 
 # ----------------------------------------------------------------------------
-# ADMIN BULK STOCK UPLOAD (/addstock)
+# ADMIN TEXT-BASED BULK STOCK UPLOAD (/addstock)
 # ----------------------------------------------------------------------------
-@router.message(F.document, Command("addstock"))
-async def handle_bulk_stock_upload(message: Message):
+@router.message(Command("addstock"))
+async def handle_addstock_start(message: Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
+    
+    args = command.args.strip().lower() if command.args else ""
+    if args not in ["facebook", "instagram"]:
+        await message.answer("⚠️ সঠিক নিয়মে ব্যবহার করুন:\n👉 <code>/addstock facebook</code> অথবা\n👉 <code>/addstock instagram</code> লিখে সেন্ড করুন।")
+        return
+    
+    await state.set_state(AdminStates.waiting_for_stock_data)
+    await state.update_data(stock_category=args)
+    await message.answer(
+        f"📂 নির্বাচিত ক্যাটাগরি: <b>{args}</b>\n\n"
+        "📝 এখন আপনার একাউন্ট বা টাস্কগুলোর লিস্ট (প্রতি লাইনে একটি করে) কপি করে এই চ্যাটে পেস্ট করে পাঠিয়ে দিন:"
+    )
 
-    args = message.text.split() if message.text else message.caption.split() if message.caption else []
-    if len(args) < 2:
-        await message.answer("⚠️ ব্যবহারের নিয়ম: ফাইলটি পাঠিয়ে ক্যাপশনে লিখুন <code>/addstock instagram</code> বা <code>/addstock facebook</code>")
+
+@router.message(AdminStates.waiting_for_stock_data, F.text)
+async def process_stock_text_input(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    if message.text in MENU_BUTTONS:
+        await state.clear()
         return
 
-    category = args[1].lower()
-    document = message.document
-
-    file_info = await message.bot.get_file(document.file_id)
-    downloaded_file = await message.bot.download_file(file_info.file_path)
-    content = downloaded_file.read().decode('utf-8')
-
-    lines = content.strip().split('\n')
+    data = await state.get_data()
+    category = data.get("stock_category")
+    await state.clear()
+    
+    lines = message.text.strip().split('\n')
     added_count = 0
-
+    
     for line in lines:
         line_data = line.strip()
         if line_data:
             await db.add_stock_account(category=category, account_data=line_data)
             added_count += 1
-
+            
     await message.answer(
-        f"✅ <b>স্টক সফলভাবে আপলোড হয়েছে!</b>\n\n"
-        f"📂 <b>ক্যাটাগরি:</b> <code>{category}</code>\n"
-        f"🔢 <b>মোট যুক্ত হয়েছে:</b> <code>{added_count} টি</code>"
+        f"✅ <b>সফলভাবে স্টক যুক্ত হয়েছে!</b>\n\n"
+        f"📂 ক্যাটাগরি: <code>{category}</code>\n"
+        f"🔢 মোট যুক্ত হয়েছে: <code>{added_count} টি</code>",
+        reply_markup=get_main_keyboard()
     )
 
 
 # ----------------------------------------------------------------------------
-# TASKS & STOCK INTEGRATION
+# TASKS & CATEGORY SELECTION
 # ----------------------------------------------------------------------------
 @router.message(F.text == BTN_TASKS)
 async def handle_tasks_menu(message: Message):
@@ -292,21 +311,15 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("⚠️ সঠিকভাবে কাজটি সম্পাদন করুন!", reply_markup=get_cancel_keyboard())
 
     elif cat_key == "facebook":
-        stock_item = await db.get_unused_stock("facebook")
-        if not stock_item:
-            await callback.answer("⚠️ দুঃখিত! বর্তমানে ফেসবুকের কোনো কাজ এভেলেবল নেই।", show_alert=True)
-            return
-
-        task_details = stock_item['account_data']
-        await db.mark_stock_as_used(stock_item['id'], user_id=user_id)
         await state.set_state(TaskStates.waiting_for_fb_uid)
-
-        fb_reward = CATEGORY_REWARDS["facebook"]
+        fb_reward = CATEGORY_REWARDS.get("facebook", 0.04)
         text = (
-            "📘 <b>Facebook Task Details:</b>\n\n"
-            f"<code>{task_details}</code>\n\n"
-            f"💰 <b>রিওয়ার্ড:</b> <code>{fb_reward:.2f} BDT</code>\n\n"
-            "📌 উপরোক্ত তথ্য অনুযায়ী কাজ সম্পন্ন করে নিচে <b>Send UID</b> বাটনে ক্লিক করুন:"
+            "📘 <b>Facebook Account Task</b>\n\n"
+            "📌 <b>নির্দেশনা:</b>\n"
+            "১. যেকোনো সচল ফেসবুক একাউন্ট ব্যবহার করুন।\n"
+            "২. একাউন্ট থেকে আপনার <b>UID</b> এবং <b>Cookies</b> সংগ্রহ করুন।\n"
+            "৩. নিচে <b>Send UID</b> বাটনে ক্লিক করে তথ্য সাবমিট করুন।\n\n"
+            f"💰 <b>রিওয়ার্ড:</b> <code>{fb_reward:.2f} BDT</code>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Send UID", callback_data="prompt_fb_uid")],
@@ -326,12 +339,13 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskStates.waiting_for_insta_2fa)
         await state.update_data(insta_user=username, insta_pass=password)
 
-        insta_reward = CATEGORY_REWARDS["instagram"]
+        insta_reward = CATEGORY_REWARDS.get("instagram", 0.05)
         text = (
+            "📸 <b>Instagram Account Task</b>\n\n"
             f"👤 <b>Username:</b> <code>{username}</code>\n"
             f"🔐 <b>Password:</b> <code>{password}</code>\n"
             f"💰 <b>রিওয়ার্ড:</b> <code>{insta_reward:.2f} BDT</code>\n\n"
-            "📸 একাউন্ট তৈরি করে 2FA চালু করুন এবং নিচের <b>2FA Set</b> বাটনে ক্লিক করুন।"
+            "📌 উপরোক্ত তথ্য দিয়ে একাউন্ট লগইন করে 2FA চালু করুন এবং নিচের <b>2FA Set</b> বাটনে ক্লিক করুন।"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔑 2FA Set", callback_data="prompt_insta_2fa")],
@@ -449,7 +463,7 @@ async def process_fb_cookies_submission(message: Message, state: FSMContext):
 
     sub_id = await db.add_submission(
         user_id=user_id, category="facebook",
-        details=f"UID: {fb_uid} | Cookies: {cookies_text}", status="pending"
+        data=f"UID: {fb_uid} | Cookies: {cookies_text}", status="pending"
     )
 
     await message.answer(
@@ -499,7 +513,7 @@ async def process_insta_2fa_submission(message: Message, state: FSMContext):
 
     sub_id = await db.add_submission(
         user_id=user_id, category="instagram",
-        details=f"Username: {username} | Pass: {password} | 2FA: {key_text}", status="pending"
+        data=f"Username: {username} | Pass: {password} | 2FA: {key_text}", status="pending"
     )
 
     await message.answer(
@@ -637,7 +651,7 @@ async def on_error(event: ErrorEvent) -> bool:
     update = event.update
     with contextlib.suppress(Exception):
         if update.callback_query:
-            await update.callback_query.answer("⚠️ একটি সমস্যা হয়েছে, আবার চেষ্টা করুনচি।", show_alert=True)
+            await update.callback_query.answer("⚠️ একটি সমস্যা হয়েছে, আবার চেষ্টা করুন।", show_alert=True)
         elif update.message:
             await update.message.answer("⚠️ একটি সমস্যা হয়েছে, আবার চেষ্টা করুন।")
     return True
