@@ -242,7 +242,7 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
             return
         await state.set_state(TaskStates.working_on_gmail)
         await safe_edit(callback.message, _gmail_task_text(task), _gmail_task_kb())
-        await callback.message.answer("⚠️ কাজ চলাকালীন যেকোনো সময় নিচে '❌ Cancel' চাপুন:", reply_markup=get_cancel_keyboard())
+        await callback.message.answer("⚠️ সঠিকভাবে কাজটি সম্পাদন করুন!", reply_markup=get_cancel_keyboard())
 
     elif cat_key == "facebook":
         await state.set_state(TaskStates.waiting_for_fb_uid)
