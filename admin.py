@@ -1,17 +1,33 @@
-import logging
 import asyncio
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from aiogram.filters import Command
+import html
+import logging
+import math
+import re
+
+from aiogram import F, Router
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardRemove,
+)
 
 from config import ADMIN_IDS
 from database import db
-from tasks import task_manager
+from keyboards import get_main_keyboard, safe_edit, withdrawal_review_kb
+from tasks import DEFAULT_TASK_REWARD, task_manager
 
 logger = logging.getLogger(__name__)
-admin_router = Router()
+
+USERS_PER_PAGE = 6
+_EMAIL = re.compile(r"^[^@\s|]+@[^@\s|]+\.[^@\s|]+$")
+_bg_tasks: set[asyncio.Task] = set()
+
 
 class AdminStates(StatesGroup):
     waiting_for_bulk_tasks = State()
@@ -21,418 +37,563 @@ class AdminStates(StatesGroup):
     waiting_for_proof_channel = State()
     waiting_for_broadcast_msg = State()
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
 
-async def get_admin_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+class IsAdmin(BaseFilter):
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return bool(event.from_user and event.from_user.id in ADMIN_IDS)
+
+
+# Every handler below is admin-only; non-admin updates fall through to other routers.
+admin_router = Router(name="admin")
+admin_router.message.filter(IsAdmin())
+admin_router.callback_query.filter(IsAdmin())
+
+
+def _fmt(x) -> str:
+    return f"{float(x):.2f}"
+
+
+def _mask_id(user_id: int) -> str:
+    s = str(user_id)
+    return f"{s[:3]}•••{s[-2:]}" if len(s) > 5 else s
+
+
+# ----------------------------------------------------------------------------
+# MAIN PANEL
+# ----------------------------------------------------------------------------
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add Tasks (Bulk)", callback_data="admin_add_bulk")],
         [InlineKeyboardButton(text="📂 Manage Task Categories", callback_data="admin_categories")],
         [InlineKeyboardButton(text="👥 User List & Ban Control", callback_data="admin_users_page_1")],
         [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="⚙️ Bot Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton(text="💳 Pending Withdrawals", callback_data="admin_withdrawals")]
+        [InlineKeyboardButton(text="💳 Pending Withdrawals", callback_data="admin_withdrawals")],
+        [InlineKeyboardButton(text="🚪 Exit Admin Panel", callback_data="admin_exit")],
     ])
-    return keyboard
 
-@admin_router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
+
+async def panel_text() -> str:
     total_users = await db.get_all_users_count()
-    available_tasks = await db.get_stock_count()
-    
-    text = (
+    stock = await db.get_stock_count()
+    pending = await db.count_pending_withdrawals()
+    return (
         "👑 <b>এডমিন কন্ট্রোল প্যানেল</b>\n\n"
         f"👥 মোট রেজিস্টার্ড ইউজার: <b>{total_users} জন</b>\n"
-        f"📦 স্টকে টাস্ক আছে: <b>{available_tasks} টি</b>\n\n"
+        f"📦 স্টকে টাস্ক আছে: <b>{stock} টি</b>\n"
+        f"💳 পেন্ডিং উইথড্রো: <b>{pending} টি</b>\n\n"
         "নিচের অপশনগুলো থেকে আপনার পছন্দ নির্বাচন করুন:"
     )
-    kb = await get_admin_keyboard()
-    
-    # নীরবে ইউজার কিবোর্ড রিমুভ করার জন্য ট্রিক (কোনো বাড়তি টেক্সট দেখাবে না)
+
+
+@admin_router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.clear()
+
+    # Remove the user reply-keyboard silently: send an instant throw-away message
+    # carrying ReplyKeyboardRemove and delete it, so nothing stays in the chat.
     try:
-        temp = await message.answer("...", reply_markup=ReplyKeyboardRemove())
-        await temp.delete()
-    except Exception:
+        tmp = await message.answer("…", reply_markup=ReplyKeyboardRemove(), disable_notification=True)
+        await tmp.delete()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Silent keyboard removal skipped: %s", e)
+
+    await message.answer(await panel_text(), reply_markup=admin_keyboard())
+
+
+@admin_router.callback_query(F.data == "admin_back")
+async def handle_admin_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(callback.message, await panel_text(), admin_keyboard())
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin_exit")
+async def handle_admin_exit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:  # noqa: BLE001
         pass
+    await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
+    await callback.answer()
 
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-# --- CATEGORY MANAGEMENT ---
+@admin_router.callback_query(F.data == "none")
+async def handle_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ----------------------------------------------------------------------------
+# CATEGORIES
+# ----------------------------------------------------------------------------
+async def categories_view() -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    for cat in await db.get_categories():
+        icon = "🟢 চালু" if cat.get("is_enabled") else "🔴 বন্ধ"
+        rows.append([InlineKeyboardButton(
+            text=f"{cat['category_name']} ({icon})",
+            callback_data=f"toggle_cat_{cat['category_key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
+    text = "📂 <b>টাস্ক ক্যাটাগরি ম্যানেজমেন্ট:</b>\nযে ক্যাটাগরি অন বা অফ করতে চান তাতে ক্লিক করুন:"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @admin_router.callback_query(F.data == "admin_categories")
 async def handle_admin_categories(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
+    text, kb = await categories_view()
+    await safe_edit(callback.message, text, kb)
+    await callback.answer()
 
-    categories = await db.get_categories()
-    keyboard_buttons = []
-    
-    for cat in categories:
-        status_icon = "🟢 চালু" if cat["is_enabled"] else "🔴 বন্ধ"
-        btn_text = f"{cat['category_name']} ({status_icon})"
-        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"toggle_cat_{cat['category_key']}")])
-
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    
-    await callback.message.edit_text("📂 <b>টাস্ক ক্যাটাগরি ম্যানেজমেন্ট:</b>\nযে ক্যাটাগরি অন বা অফ করতে চান তাতে ক্লিক করুন:", reply_markup=kb, parse_mode="HTML")
 
 @admin_router.callback_query(F.data.startswith("toggle_cat_"))
 async def handle_toggle_category(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    
-    cat_key = callback.data.replace("toggle_cat_", "")
+    cat_key = callback.data.removeprefix("toggle_cat_")
     new_status = await db.toggle_category(cat_key)
-    
-    status_msg = "চালু" if new_status else "বন্ধ"
-    await callback.answer(f"⚠️ ক্যাটাগরি সফলভাবে {status_msg} করা হয়েছে!", show_alert=True)
-    
-    categories = await db.get_categories()
-    keyboard_buttons = []
-    for cat in categories:
-        status_icon = "🟢 চালু" if cat["is_enabled"] else "🔴 বন্ধ"
-        btn_text = f"{cat['category_name']} ({status_icon})"
-        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"toggle_cat_{cat['category_key']}")])
+    await callback.answer(f"ক্যাটাগরি {'চালু' if new_status else 'বন্ধ'} করা হয়েছে!")
+    text, kb = await categories_view()
+    await safe_edit(callback.message, text, kb)
 
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await callback.message.edit_reply_markup(reply_markup=kb)
 
-# --- PAGINATED USER LIST & BAN CONTROL ---
-@admin_router.callback_query(F.data.startswith("admin_users_page_"))
-async def handle_admin_user_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    page = int(callback.data.replace("admin_users_page_", ""))
-    limit = 6
-    users, total_count = await db.get_users_paginated(page, limit) if hasattr(db, 'get_users_paginated') else (await db.get_users_paginated(page, limit), await db.get_all_users_count())
-    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
-
+# ----------------------------------------------------------------------------
+# USERS: pagination + live Ban/Unban toggle
+# ----------------------------------------------------------------------------
+async def users_view(page: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    users, total = await db.get_users_paginated(page, USERS_PER_PAGE)
+    total_pages = max(1, math.ceil(total / USERS_PER_PAGE))
+    if page > total_pages:                       # e.g. the last page emptied out
+        page = total_pages
+        users, total = await db.get_users_paginated(page, USERS_PER_PAGE)
     if not users:
-        await callback.answer("⚠️ কোনো ইউজার পাওয়া যায়নি।", show_alert=True)
-        return
+        return None
 
-    text = f"👥 <b>বোটের ইউজার ম্যানেজমেন্ট (পেজ {page}/{total_pages}):</b>\n\n"
-    
-    keyboard_buttons = []
+    text = f"👥 <b>ইউজার ম্যানেজমেন্ট (পেজ {page}/{total_pages} • মোট {total}):</b>\n\n"
+    rows = []
     for u in users:
         uid = u["user_id"]
-        uname = u.get("username", "User")
-        bal = u.get("balance", 0.0)
-        banned = u.get("is_banned", False)
-        
-        status_str = "🟢 Unban" if banned else "🔴 Ban"
-        status_badge = "🚫 [Banned]" if banned else "✅ [Active]"
-        
-        text += f"• <b>{uname}</b> {status_badge}\n  ID: <code>{uid}</code> | Bal: <b>{bal} BDT</b>\n"
-        
-        keyboard_buttons.append([
-            InlineKeyboardButton(text=f"👤 {uname}", callback_data="none"),
-            InlineKeyboardButton(text=status_str, callback_data=f"toggle_ban_{uid}_{page}")
+        uname = html.escape(str(u.get("username") or f"User_{uid}"))
+        banned = bool(u.get("is_banned"))
+        badge = "❌ [Banned]" if banned else "✅ [Active]"
+        text += (
+            f"• <b>{uname}</b> {badge}\n"
+            f"  ID: <code>{uid}</code> | Bal: <b>{_fmt(u.get('balance') or 0)} BDT</b>\n"
+        )
+        rows.append([
+            InlineKeyboardButton(text=f"{'❌' if banned else '✅'} {str(u.get('username') or uid)[:18]}", callback_data="none"),
+            InlineKeyboardButton(
+                text="🟢 Unban" if banned else "🔴 Ban",
+                callback_data=f"toggle_ban_{uid}_{page}",
+            ),
         ])
 
-    nav_buttons = []
+    nav = []
     if page > 1:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_users_page_{page-1}"))
-    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="none"))
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_users_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="none"))
     if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_page_{page+1}"))
-    
-    if nav_buttons:
-        keyboard_buttons.append(nav_buttons)
-        
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")])
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_page_{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
+@admin_router.callback_query(F.data.startswith("admin_users_page_"))
+async def handle_admin_user_list(callback: CallbackQuery):
     try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
+        page = max(1, int(callback.data.removeprefix("admin_users_page_")))
+    except ValueError:
         await callback.answer()
+        return
+    view = await users_view(page)
+    if not view:
+        await callback.answer("⚠️ কোনো ইউজার পাওয়া যায়নি।", show_alert=True)
+        return
+    await safe_edit(callback.message, *view)
+    await callback.answer()
+
 
 @admin_router.callback_query(F.data.startswith("toggle_ban_"))
 async def handle_toggle_ban_inline(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    
-    parts = callback.data.split("_")
-    uid = int(parts[2])
-    page = int(parts[3])
-
-    user = await db.get_or_create_user(uid, "")
-    current_ban = user.get("is_banned", False)
-    new_ban_status = not current_ban
-    
-    await db.set_user_ban_status(uid, new_ban_status)
-    
-    action_name = "ব্যান" if new_ban_status else "আনব্যান"
-    await callback.answer(f"ইউজার {uid} কে সফলভাবে {action_name} করা হয়েছে!", show_alert=True)
-
-    callback.data = f"admin_users_page_{page}"
-    await handle_admin_user_list(callback)
-
-# --- SETTINGS & BROADCAST ---
-@admin_router.callback_query(F.data == "admin_settings")
-async def handle_admin_settings(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    try:
+        _, _, uid_s, page_s = callback.data.split("_")
+        uid, page = int(uid_s), int(page_s)
+    except ValueError:
+        await callback.answer("⚠️ অবৈধ রিকোয়েস্ট।", show_alert=True)
         return
 
-    min_wd = await db.get_setting("min_withdraw", "50.0")
-    ref_comm = await db.get_setting("referral_commission", "10.0")
-    daily_bonus = await db.get_setting("daily_bonus", "1.0")
-    proof_chan = await db.get_setting("proof_channel", "@YourProofChannel")
+    if uid in ADMIN_IDS:
+        await callback.answer("⚠️ এডমিনকে ব্যান করা যাবে না।", show_alert=True)
+        return
+
+    user = await db.get_user(uid)
+    if not user:
+        await callback.answer("⚠️ ইউজার খুঁজে পাওয়া যায়নি।", show_alert=True)
+        return
+
+    new_ban = not bool(user.get("is_banned"))
+    if not await db.set_user_ban_status(uid, new_ban):
+        await callback.answer("⚠️ আপডেট ব্যর্থ হয়েছে।", show_alert=True)
+        return
+
+    await callback.answer(f"ইউজার {uid} {'ব্যান' if new_ban else 'আনব্যান'} করা হয়েছে ✔️")
+    view = await users_view(page)             # re-render text + keyboard instantly
+    if view:
+        await safe_edit(callback.message, *view)
+
+
+# ----------------------------------------------------------------------------
+# SETTINGS (min_withdraw / referral_commission / daily_bonus / proof_channel)
+# ----------------------------------------------------------------------------
+async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
+    min_wd = await db.get_float_setting("min_withdraw", 50.0)
+    ref_comm = await db.get_float_setting("referral_commission", 10.0)
+    bonus = await db.get_float_setting("daily_bonus", 1.0)
+    proof = await db.get_setting("proof_channel", "")
 
     text = (
         "⚙️ <b>বোট কনফিগারেশন সেটিংস:</b>\n\n"
-        f"💵 সর্বনিম্ন উইথড্রো: <b>{min_wd} BDT</b>\n"
-        f"🎁 রেফারেল কমিশন: <b>{ref_comm}%</b>\n"
-        f"🎁 ডেইলি বোনাস: <b>{daily_bonus} BDT</b>\n"
-        f"📢 পেমেন্ট প্রুফ চ্যানেল: <code>{proof_chan}</code>"
+        f"💵 সর্বনিম্ন উইথড্রো: <b>{min_wd:g} BDT</b>\n"
+        f"🎁 রেফারেল কমিশন: <b>{ref_comm:g}%</b>\n"
+        f"🎁 ডেইলি বোনাস: <b>{bonus:g} BDT</b>\n"
+        f"📢 পেমেন্ট প্রুফ চ্যানেল: <code>{html.escape(proof) if proof else 'সেট করা নেই'}</code>\n\n"
+        "<i>পরিবর্তন সাথে সাথে ইউজার প্যানেলে কার্যকর হয়।</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Edit Min Withdraw", callback_data="edit_min_withdraw")],
         [InlineKeyboardButton(text="✏️ Edit Ref Commission", callback_data="edit_ref_comm")],
         [InlineKeyboardButton(text="✏️ Edit Daily Bonus", callback_data="edit_daily_bonus")],
         [InlineKeyboardButton(text="✏️ Edit Proof Channel", callback_data="edit_proof_channel")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]
+        [InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")],
     ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    return text, kb
+
+
+def _cancel_edit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data="admin_settings")]
+    ])
+
+
+@admin_router.callback_query(F.data == "admin_settings")
+async def handle_admin_settings(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = await settings_view()
+    await safe_edit(callback.message, text, kb)
+    await callback.answer()
+
+
+async def _prompt_edit(callback: CallbackQuery, state: FSMContext, new_state: State, prompt: str):
+    await state.set_state(new_state)
+    await safe_edit(callback.message, prompt, _cancel_edit_kb())
+    await callback.answer()
+
 
 @admin_router.callback_query(F.data == "edit_min_withdraw")
 async def handle_edit_min_withdraw(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_min_withdraw)
-    await callback.message.edit_text("✏️ নতুন **সর্বনিম্ন উইথড্রো পরিমাণ (BDT)** লিখে পাঠান:")
+    await _prompt_edit(callback, state, AdminStates.waiting_for_min_withdraw,
+                       "✏️ নতুন <b>সর্বনিম্ন উইথড্রো পরিমাণ (BDT)</b> লিখে পাঠান:")
 
-@admin_router.message(AdminStates.waiting_for_min_withdraw)
-async def process_new_min_withdraw(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        val = float(message.text.strip())
-        await db.update_setting("min_withdraw", str(val))
-        await message.answer(f"✅ সর্বনিম্ন উইথড্রো সফলভাবে <b>{val} BDT</b> সেট করা হয়েছে!", parse_mode="HTML")
-    except ValueError:
-        await message.answer("⚠️ শুধুমাত্র সংখ্যা লিখুন।")
-    await state.clear()
+
+@admin_router.callback_query(F.data == "edit_ref_comm")
+async def handle_edit_ref_comm(callback: CallbackQuery, state: FSMContext):
+    await _prompt_edit(callback, state, AdminStates.waiting_for_ref_commission,
+                       "✏️ নতুন <b>রেফারেল কমিশন (%)</b> লিখে পাঠান (০ - ১০০):")
+
 
 @admin_router.callback_query(F.data == "edit_daily_bonus")
 async def handle_edit_daily_bonus(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_daily_bonus)
-    await callback.message.edit_text("✏️ নতুন **ডেইলি বোনাস পরিমাণ (BDT)** লিখে পাঠান:")
+    await _prompt_edit(callback, state, AdminStates.waiting_for_daily_bonus,
+                       "✏️ নতুন <b>ডেইলি বোনাস পরিমাণ (BDT)</b> লিখে পাঠান:")
 
-@admin_router.message(AdminStates.waiting_for_daily_bonus)
-async def process_new_daily_bonus(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        val = float(message.text.strip())
-        await db.update_setting("daily_bonus", str(val))
-        await message.answer(f"✅ ডেইলি বোনাস সফলভাবে <b>{val} BDT</b> সেট করা হয়েছে!", parse_mode="HTML")
-    except ValueError:
-        await message.answer("⚠️ শুধুমাত্র সংখ্যা লিখুন।")
-    await state.clear()
 
 @admin_router.callback_query(F.data == "edit_proof_channel")
 async def handle_edit_proof_channel(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_proof_channel)
-    await callback.message.edit_text("✏️ পেমেন্ট প্রুফ চ্যানেলের ইউজারনেম লিখে পাঠান (যেমন: <code>@Technova_Proof</code>):", parse_mode="HTML")
+    await _prompt_edit(
+        callback, state, AdminStates.waiting_for_proof_channel,
+        "✏️ পেমেন্ট প্রুফ চ্যানেলের ইউজারনেম বা আইডি লিখে পাঠান "
+        "(যেমন: <code>@Technova_Proof</code> বা <code>-1001234567890</code>)।\n"
+        "বন্ধ করতে <code>-</code> লিখুন। বটকে চ্যানেলে এডমিন করা থাকতে হবে।",
+    )
 
-@admin_router.message(AdminStates.waiting_for_proof_channel)
-async def process_new_proof_channel(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+
+async def _save_number_setting(message: Message, state: FSMContext, key: str, label: str,
+                               unit: str, lo: float, hi: float | None):
+    try:
+        val = float(message.text.strip().replace(",", ""))
+        if not math.isfinite(val) or val < lo or (hi is not None and val > hi):
+            raise ValueError
+    except ValueError:
+        rng = f"{lo:g} - {hi:g}" if hi is not None else f"{lo:g} বা তার বেশি"
+        await message.answer(f"⚠️ একটি সঠিক সংখ্যা লিখুন ({rng})।", reply_markup=_cancel_edit_kb())
         return
-    ch_name = message.text.strip()
-    if not ch_name.startswith("@"):
-        ch_name = "@" + ch_name
-    await db.update_setting("proof_channel", ch_name)
-    await message.answer(f"✅ পেমেন্ট প্রুফ চ্যানেল সফলভাবে <b>{ch_name}</b> সেট করা হয়েছে!", parse_mode="HTML")
+
+    if not await db.update_setting(key, f"{val:g}"):
+        await message.answer("⚠️ সেটিং সেভ করা যায়নি, আবার চেষ্টা করুন।", reply_markup=_cancel_edit_kb())
+        return
+
     await state.clear()
+    text, kb = await settings_view()
+    await message.answer(f"✅ {label} সফলভাবে <b>{val:g} {unit}</b> সেট করা হয়েছে!\n\n{text}", reply_markup=kb)
 
+
+@admin_router.message(AdminStates.waiting_for_min_withdraw, F.text)
+async def process_new_min_withdraw(message: Message, state: FSMContext):
+    await _save_number_setting(message, state, "min_withdraw", "সর্বনিম্ন উইথড্রো", "BDT", 0.01, None)
+
+
+@admin_router.message(AdminStates.waiting_for_ref_commission, F.text)
+async def process_new_ref_commission(message: Message, state: FSMContext):
+    await _save_number_setting(message, state, "referral_commission", "রেফারেল কমিশন", "%", 0, 100)
+
+
+@admin_router.message(AdminStates.waiting_for_daily_bonus, F.text)
+async def process_new_daily_bonus(message: Message, state: FSMContext):
+    await _save_number_setting(message, state, "daily_bonus", "ডেইলি বোনাস", "BDT", 0, None)
+
+
+def _normalize_channel(raw: str) -> str | None:
+    value = raw.strip()
+    if value == "-":
+        return ""
+    value = re.sub(r"^https?://t\.me/", "", value, flags=re.I).strip("/")
+    if re.fullmatch(r"-100\d{5,}", value):
+        return value
+    value = value.lstrip("@")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", value):
+        return "@" + value
+    return None
+
+
+@admin_router.message(AdminStates.waiting_for_proof_channel, F.text)
+async def process_new_proof_channel(message: Message, state: FSMContext):
+    channel = _normalize_channel(message.text)
+    if channel is None:
+        await message.answer("⚠️ সঠিক ইউজারনেম (@name) বা আইডি (-100...) দিন।", reply_markup=_cancel_edit_kb())
+        return
+    if not await db.update_setting("proof_channel", channel):
+        await message.answer("⚠️ সেটিং সেভ করা যায়নি, আবার চেষ্টা করুন।", reply_markup=_cancel_edit_kb())
+        return
+
+    await state.clear()
+    warning = ""
+    if channel:
+        try:
+            chat_id = int(channel) if channel.startswith("-") else channel
+            member = await message.bot.get_chat_member(chat_id, (await message.bot.me()).id)
+            if member.status not in ("administrator", "creator"):
+                warning = "\n\n⚠️ বট এই চ্যানেলের এডমিন নয় - পোস্ট করতে পারবে না।"
+        except Exception:  # noqa: BLE001
+            warning = "\n\n⚠️ চ্যানেলটি যাচাই করা যায়নি - বটকে এডমিন করা আছে কিনা দেখুন।"
+
+    text, kb = await settings_view()
+    shown = html.escape(channel) if channel else "বন্ধ"
+    await message.answer(f"✅ পেমেন্ট প্রুফ চ্যানেল: <b>{shown}</b>{warning}\n\n{text}", reply_markup=kb)
+
+
+# ----------------------------------------------------------------------------
+# BROADCAST (runs in the background so the bot keeps serving users)
+# ----------------------------------------------------------------------------
 @admin_router.callback_query(F.data == "admin_broadcast")
 async def handle_broadcast_click(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_for_broadcast_msg)
-    await callback.message.edit_text("📢 সমস্ত ইউজারের কাছে পাঠানোর জন্য আপনার ব্রডকাস্ট মেসেজটি লিখুন:")
+    await _prompt_edit(
+        callback, state, AdminStates.waiting_for_broadcast_msg,
+        "📢 সমস্ত ইউজারের কাছে পাঠানোর জন্য আপনার ব্রডকাস্ট মেসেজটি পাঠান (টেক্সট/ছবি/ভিডিও):",
+    )
+    # the cancel button of _prompt_edit goes to settings; point it back to the panel instead
+    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data="admin_back")]
+    ]))
+
+
+async def _run_broadcast(bot, admin_chat: int, from_chat: int, message_id: int, user_ids: list[int]):
+    sent = failed = 0
+    for uid in user_ids:
+        for attempt in range(2):
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=message_id)
+                sent += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramForbiddenError:
+                failed += 1
+                break
+            except Exception:  # noqa: BLE001
+                failed += 1
+                break
+        await asyncio.sleep(0.05)            # ~20 msg/s, under Telegram's global limit
+    try:
+        await bot.send_message(
+            admin_chat,
+            f"✅ ব্রডকাস্ট সম্পন্ন!\n📤 সফল: <b>{sent}</b>\n🚫 ব্যর্থ/ব্লক: <b>{failed}</b>",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not send broadcast report: %s", e)
+
 
 @admin_router.message(AdminStates.waiting_for_broadcast_msg)
 async def process_broadcast_send(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    user_ids = await db.get_all_user_ids()
-    sent_count = 0
-    await message.answer(f"⏳ মোট <b>{len(user_ids)}</b> জন ইউজারের কাছে মেসেজ পাঠানো শুরু হয়েছে...", parse_mode="HTML")
-    
-    for uid in user_ids:
-        try:
-            await message.copy_to(chat_id=uid)
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-
-    await message.answer(f"✅ সফলভাবে <b>{sent_count}</b> জন ইউজারের কাছে ব্রডকাস্ট মেসেজ পাঠানো হয়েছে!", parse_mode="HTML")
     await state.clear()
+    user_ids = await db.get_broadcast_user_ids()
+    await message.answer(f"⏳ মোট <b>{len(user_ids)}</b> জন ইউজারের কাছে মেসেজ পাঠানো শুরু হয়েছে...")
+    task = asyncio.create_task(
+        _run_broadcast(message.bot, message.chat.id, message.chat.id, message.message_id, user_ids)
+    )
+    _bg_tasks.add(task)                       # keep a reference so it is not garbage-collected
+    task.add_done_callback(_bg_tasks.discard)
 
-@admin_router.callback_query(F.data == "admin_back")
-async def handle_admin_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    kb = await get_admin_keyboard()
-    from main import get_main_keyboard
-    await callback.message.edit_text("👑 <b>এডমিন কন্ট্রোল প্যানেল</b>", reply_markup=kb, parse_mode="HTML")
-    await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
+
+# ----------------------------------------------------------------------------
+# WITHDRAWAL REVIEW
+# ----------------------------------------------------------------------------
+def _withdrawal_text(req: dict) -> str:
+    return (
+        f"🧾 <b>Request #{req['id']}</b>\n"
+        f"👤 ইউজার আইডি: <code>{req['user_id']}</code>\n"
+        f"💰 পরিমাণ: <b>{_fmt(req['amount'])} BDT</b>\n"
+        f"💳 মেথড: <b>{html.escape(str(req['method']))}</b>\n"
+        f"📱 অ্যাকাউন্ট: <code>{html.escape(str(req['account_no']))}</code>"
+    )
+
 
 @admin_router.callback_query(F.data == "admin_withdrawals")
 async def handle_admin_withdrawals(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    withdrawals = await db.get_pending_withdrawals()
+    withdrawals, total = await db.get_pending_withdrawals(limit=20)
     if not withdrawals:
-        await callback.answer("⚠️ বর্তমানে কোনো পেন্ডিং উইথড্রো রিকোয়েস্ট নেই।", show_alert=True)
+        await callback.answer("⚠️ বর্তমানে কোনো পেন্ডিং উইথড্রো রিকোয়েস্ট নেই।", show_alert=True)
         return
 
-    await callback.message.edit_text("💳 <b>পেন্ডিং উইথড্রো রিকোয়েস্টসমূহ:</b>", parse_mode="HTML")
+    note = f" (প্রথম {len(withdrawals)} টি, মোট {total})" if total > len(withdrawals) else f" ({total})"
+    await safe_edit(
+        callback.message,
+        f"💳 <b>পেন্ডিং উইথড্রো রিকোয়েস্টসমূহ{note}:</b>",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]]),
+    )
     for req in withdrawals:
-        req_id = req["id"]
-        user_id = req["user_id"]
-        amount = req["amount"]
-        method = req["method"]
-        account_no = req["account_no"]
-
-        text = (
-            f"👤 ইউজার আইডি: <code>{user_id}</code>\n"
-            f"💰 পরিমাণ: <b>{amount} BDT</b>\n"
-            f"💳 মেথড: <b>{method}</b>\n"
-            f"📱 নম্বর: <code>{account_no}</code>"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_wd_{req_id}"),
-                InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_wd_{req_id}")
-            ]
-        ])
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await callback.message.answer(_withdrawal_text(req), reply_markup=withdrawal_review_kb(req["id"]))
     await callback.answer()
 
-@admin_router.callback_query(F.data.startswith("approve_wd_") | F.data.startswith("reject_wd_"))
+
+async def _post_proof(bot, req: dict) -> None:
+    channel = (await db.get_setting("proof_channel", "")).strip()
+    if not channel:
+        return
+    chat_id = int(channel) if channel.startswith("-") else channel
+    text = (
+        "🎉 <b>New Successful Withdrawal!</b>\n\n"
+        f"👤 User ID: <code>{_mask_id(req['user_id'])}</code>\n"
+        f"💰 Amount: <b>{_fmt(req['amount'])} BDT</b>\n"
+        f"💳 Method: <b>{html.escape(str(req['method']))}</b>\n"
+        "✅ Status: <b>Paid / Approved</b>\n\n"
+        "🤖 Join Bot & Start Earning Now!"
+    )
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error posting proof to %s: %s", channel, e)
+
+
+@admin_router.callback_query(F.data.regexp(r"^(approve|reject)_wd_\d+$"))
 async def handle_withdrawal_action(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    action, _, req_id_s = callback.data.split("_")
+    status = "approved" if action == "approve" else "rejected"
+
+    ok, req = await db.update_withdrawal_status(int(req_id_s), status)
+    if not ok or not req:
+        # already handled by another admin (or a refund failure) - drop the stale buttons
+        await callback.answer("⚠️ রিকোয়েস্টটি ইতিমধ্যে প্রসেস হয়েছে বা আপডেট করা যায়নি।", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
         return
 
-    parts = callback.data.split("_")
-    action = parts[0]
-    req_id = int(parts[2])
+    user_id, amount, method = req["user_id"], float(req["amount"]), req["method"]
+    bot = callback.bot
 
-    status = "approved" if action == "approve" else "rejected"
-    success, req_data = await db.update_withdrawal_status(req_id, status)
-
-    if success and req_data:
-        user_id = req_data['user_id']
-        amount = req_data['amount']
-        method = req_data['method']
-
-        if status == "approved":
-            msg = "✅ উইথড্রো এপ্রুভ হয়েছে।"
-            try:
-                await callback.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "🎉 <b>আপনার উইথড্রো সফল হয়েছে!</b>\n\n"
-                        f"💰 পরিমাণ: <b>{amount} BDT</b>\n"
-                        f"💳 মাধ্যম: <b>{method}</b>\n\n"
-                        "✅ আপনার পেমেন্ট সফলভাবে পাঠিয়ে দেওয়া হয়েছে। পেমেন্ট প্রুফ চ্যানেল চেক করুন!"
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error sending approval DM: {e}")
-
-            try:
-                proof_chan = await db.get_setting("proof_channel", "")
-                if proof_chan and proof_chan.startswith("@"):
-                    proof_text = (
-                        "🎉 <b>New Successful Withdrawal!</b>\n\n"
-                        f"👤 User ID: <code>{user_id}</code>\n"
-                        f"💰 Amount: <b>{amount} BDT</b>\n"
-                        f"💳 Method: <b>{method}</b>\n"
-                        "✅ Status: <b>Paid / Approved</b>\n\n"
-                        "🤖 Join Bot & Start Earning Now!"
-                    )
-                    await callback.bot.send_message(chat_id=proof_chan, text=proof_text, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"Error posting proof: {e}")
-        else:
-            msg = "❌ উইথড্রো রিজেক্ট এবং টাকা রিফান্ড করা হয়েছে।"
-            
-            try:
-                user = await db.get_or_create_user(user_id, "")
-                current_bal = float(user.get("balance", 0.0))
-                new_bal = current_bal + float(amount)
-                await db.supabase.table("users").update({"balance": new_bal}).eq("user_id", user_id).execute()
-            except Exception as e:
-                logger.error(f"Error refunding balance: {e}")
-
-            try:
-                await callback.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "❌ <b>আপনার উইথড্রো রিকোয়েস্ট রিজেক্ট করা হয়েছে!</b>\n\n"
-                        f"💰 পরিমাণ: <b>{amount} BDT</b> আপনার একাউন্টে ফিরিয়ে দেওয়া হয়েছে।\n\n"
-                        "⚠️ ভুল নম্বর বা অন্য কোনো সমস্যার কারণে এটি হতে পারে। দয়া করে সঠিক তথ্য দিয়ে আবার উইথড্রো করুন।"
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error sending rejection DM: {e}")
-
-        await callback.message.edit_text(f"{callback.message.text}\n\n{msg}", parse_mode="HTML")
+    if status == "approved":
+        verdict = "✅ উইথড্রো এপ্রুভ হয়েছে।"
+        try:
+            await bot.send_message(
+                user_id,
+                "🎉 <b>আপনার উইথড্রো সফল হয়েছে!</b>\n\n"
+                f"💰 পরিমাণ: <b>{_fmt(amount)} BDT</b>\n"
+                f"💳 মাধ্যম: <b>{html.escape(str(method))}</b>\n\n"
+                "✅ আপনার পেমেন্ট সফলভাবে পাঠিয়ে দেওয়া হয়েছে। পেমেন্ট প্রুফ চ্যানেল চেক করুন!",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error sending approval DM to %s: %s", user_id, e)
+        await _post_proof(bot, req)
     else:
-        await callback.answer("⚠️ সমস্যা হয়েছে।", show_alert=True)
+        verdict = "❌ উইথড্রো রিজেক্ট এবং টাকা রিফান্ড করা হয়েছে।"
+        user = await db.get_user(user_id) or {}
+        try:
+            await bot.send_message(
+                user_id,
+                "❌ <b>আপনার উইথড্রো রিকোয়েস্ট রিজেক্ট করা হয়েছে!</b>\n\n"
+                f"💰 <b>{_fmt(amount)} BDT</b> আপনার ব্যালেন্সে ফিরিয়ে দেওয়া হয়েছে।\n"
+                f"💵 বর্তমান ব্যালেন্স: <b>{_fmt(user.get('balance') or 0)} BDT</b>\n\n"
+                "⚠️ ভুল অ্যাকাউন্ট নম্বর বা অন্য কোনো সমস্যার কারণে এটি হতে পারে। "
+                "দয়া করে সঠিক তথ্য দিয়ে আবার উইথড্রো করুন।",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error sending rejection DM to %s: %s", user_id, e)
 
+    await safe_edit(callback.message, f"{callback.message.html_text}\n\n{verdict}")
+    await callback.answer(verdict)
+
+
+# ----------------------------------------------------------------------------
+# BULK TASKS
+# ----------------------------------------------------------------------------
 @admin_router.callback_query(F.data == "admin_add_bulk")
 async def handle_add_bulk_click(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
     await state.set_state(AdminStates.waiting_for_bulk_tasks)
-    await callback.message.edit_text("📥 <code>email|password</code> ফরম্যাটে বাল্ক টাস্ক মেসেজ দিন:", parse_mode="HTML")
+    await safe_edit(
+        callback.message,
+        "📥 প্রতি লাইনে একটি টাস্ক দিন:\n<code>email|password</code>\n"
+        "<code>email|password|recovery</code>\n<code>email|password|recovery|reward</code>",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Cancel", callback_data="admin_back")]]),
+    )
+    await callback.answer()
 
-@admin_router.message(AdminStates.waiting_for_bulk_tasks)
+
+@admin_router.message(AdminStates.waiting_for_bulk_tasks, F.text)
 async def process_bulk_tasks_input(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    task_list, seen, skipped = [], set(), 0
+
+    for line in message.text.strip().splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or not _EMAIL.match(parts[0]) or not parts[1] or parts[0].lower() in seen:
+            skipped += 1
+            continue
+        recovery = parts[2] if len(parts) >= 3 and parts[2] else task_manager.generate_random_gmail()["recovery"]
+        try:
+            reward = float(parts[3]) if len(parts) >= 4 and parts[3] else DEFAULT_TASK_REWARD
+            if not math.isfinite(reward) or reward <= 0:
+                raise ValueError
+        except ValueError:
+            skipped += 1
+            continue
+        seen.add(parts[0].lower())
+        task_list.append({
+            "email": parts[0],
+            "password": parts[1],
+            "recovery": recovery,
+            "status": "available",
+            "reward": reward,
+        })
+
+    if not task_list:
+        await message.answer("⚠️ সঠিক ফরম্যাটে দিন: <code>email|password</code>", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Cancel", callback_data="admin_back")]]))
         return
 
-    lines = message.text.strip().split("\n")
-    task_list = []
-
-    for line in lines:
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if len(parts) >= 2:
-            email = parts[0]
-            password = parts[1]
-            recovery = parts[2] if len(parts) >= 3 else task_manager.generate_random_gmail()["recovery"]
-            task_list.append({
-                "email": email,
-                "password": password,
-                "recovery": recovery,
-                "status": "available",
-                "reward": 10.0
-            })
-
-    if task_list:
-        inserted = await db.add_bulk_tasks(task_list)
-        await message.answer(f"✅ <b>{inserted}</b> টি টাস্ক আপলোড করা হয়েছে!", parse_mode="HTML")
-    else:
-        await message.answer("⚠️ সঠিক ফরম্যাটে দিন।")
     await state.clear()
+    inserted = await db.add_bulk_tasks(task_list)
+    extra = f"\n⚠️ বাদ গেছে: <b>{skipped}</b> লাইন" if skipped else ""
+    await message.answer(
+        f"✅ <b>{inserted}</b> টি টাস্ক আপলোড করা হয়েছে!{extra}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_back")]]),
+    )
