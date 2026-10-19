@@ -218,6 +218,7 @@ def _gmail_task_kb() -> InlineKeyboardMarkup:
 
 def _gmail_task_text(task: dict) -> str:
     first, last = task_manager.display_names(task)
+    reward_amount = CATEGORY_REWARDS["gmail"]
     return (
         "✏️ <b>নিচে দেওয়া তথ্য দিয়ে জিমেইল একাউন্ট তৈরি করুন:</b>\n\n"
         f"👤 <b>First Name:</b> <code>{html.escape(first)}</code>\n"
@@ -263,7 +264,8 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
     elif cat_key == "instagram":
         insta_reward = CATEGORY_REWARDS["instagram"]
         await state.set_state(TaskStates.waiting_for_insta_2fa)
-        await safe_edit(callback.message, "🔑 <b>Enter 2FA Key:</b> ⤵️")
+        await safe_edit(callback.message, "🔑 <b>Enter 2FA Key:</b> ⤵️"
+        f"💰 <b>রিওয়ার্ড:</b> <code>{insta_reward:.2f} BDT</code>")
         await callback.message.answer("⚠️ আপনার 2FA Key পেস্ট করে সেন্ড করুন:", reply_markup=get_cancel_keyboard())
 
     else:
@@ -432,8 +434,15 @@ async def handle_insta_confirm(callback: CallbackQuery, state: FSMContext):
     await safe_edit(callback.message, "⏳ <b>Payment will be processed within 2 to 72 hours.</b>")
     await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
     await callback.answer()
-
-
+@router.message()
+async def unknown_command_handler(message: Message):
+    await message.answer(
+        "┏ ⚠️ <b>অপরিচিত কমান্ড বা বার্তা!</b>\n"
+        "┃\n"
+        "┣ ❌ দুঃখিত, আপনার পাঠানো লেখা বা কমান্ডটি আমি বুঝতে পারিনি।\n"
+        "┗ 💡 দয়া করে নিচের মেনু ব্যবহার করুন অথবা বট রিফ্রেশ করতে /start লিখুন।",
+        parse_mode="HTML"
+    )
 # ----------------------------------------------------------------------------
 # GLOBAL ERROR HANDLER
 # ----------------------------------------------------------------------------
