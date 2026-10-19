@@ -109,10 +109,6 @@ class Database:
         forbid_negative_balance: bool = False,
         retries: int = 8,
     ) -> tuple[str, dict | None]:
-        """Add `deltas` to numeric user columns. The UPDATE only matches if the
-        columns still hold the values we read, so concurrent writers can never
-        overwrite each other. Returns (status, row); status is one of
-        'ok' | 'insufficient' | 'missing' | 'conflict'."""
         fields = list(deltas.keys())
         for attempt in range(retries):
             res = await self.client.table("users").select(",".join(fields)).eq("user_id", user_id).limit(1).execute()
@@ -157,7 +153,6 @@ class Database:
                     user["username"] = username
                 return user
 
-            # Referrals only count for brand-new users with a real, different referrer.
             valid_ref = None
             if referred_by and referred_by != user_id and await self.get_user(referred_by):
                 valid_ref = referred_by
@@ -174,7 +169,7 @@ class Database:
             }
             try:
                 inserted = await self.client.table("users").insert(user_data).execute()
-            except Exception:  # noqa: BLE001  (duplicate key: a parallel update created it first)
+            except Exception:  # noqa: BLE001
                 existing = await self.get_user(user_id)
                 if existing:
                     return existing
@@ -207,7 +202,7 @@ class Database:
             res = await self.client.table("users").update({"is_banned": ban}).eq("user_id", user_id).execute()
             if not res.data:
                 return False
-            self._ban_cache[user_id] = (time.monotonic(), ban)   # takes effect immediately
+            self._ban_cache[user_id] = (time.monotonic(), ban)
             return True
         except Exception as e:  # noqa: BLE001
             logger.error("Error updating ban status: %s", e)
@@ -237,7 +232,6 @@ class Database:
             return 0
 
     async def get_broadcast_user_ids(self) -> list[int]:
-        """All non-banned users, paged because Supabase caps a response at 1000 rows."""
         ids: list[int] = []
         start, size = 0, 1000
         try:
@@ -267,7 +261,6 @@ class Database:
             if bonus <= 0:
                 return False, "⚠️ ডেইলি বোনাস বর্তমানে বন্ধ আছে।", 0.0
 
-            # Atomic "claim the day": only one concurrent request can flip last_checkin.
             marked = (
                 await self.client.table("users")
                 .update({"last_checkin": today})
@@ -332,8 +325,6 @@ class Database:
             logger.warning("Stale task release skipped: %s", e)
 
     async def claim_task(self, user_id: int, fallback_task: dict | None = None) -> dict | None:
-        """Reserve one task for this user. Re-uses the user's open task, otherwise
-        atomically takes an available one, otherwise stores `fallback_task`."""
         try:
             existing = await self.get_user_assigned_task(user_id)
             if existing:
@@ -376,9 +367,6 @@ class Database:
             logger.error("Error releasing task: %s", e)
 
     async def complete_task(self, task_id: int, user_id: int) -> dict | None:
-        """Pay out a task exactly once. The reward comes from the task row in the
-        DB (never from client/FSM data). Returns {'reward', 'referrer_id', 'commission'}
-        or None if the task was not payable."""
         try:
             res = (
                 await self.client.table("tasks").update({"status": "completed"})
@@ -409,26 +397,86 @@ class Database:
             logger.error("Error completing task %s: %s", task_id, e)
             return None
 
-    async def add_submission(self, user_id: int, category: str, data: str) -> bool:
+    # ------------------------------------------------------------------
+    # NEW STOCK MANAGEMENT METHODS (Facebook & Instagram File Upload)
+    # ------------------------------------------------------------------
+    async def add_stock_account(self, category: str, account_data: str) -> bool:
+        """স্টক টেবিলে নতুন অ্যাকাউন্ট বা টাস্ক যুক্ত করে"""
         try:
-            await self.client.table("user_submissions").insert({
-                "user_id": user_id,
+            await self.client.table("stock_accounts").insert({
                 "category": category,
-                "submission_data": data,
-                "status": "pending",
+                "account_data": account_data,
+                "is_used": False
             }).execute()
             return True
+        except Exception as e:
+            logger.error("Error adding stock account: %s", e)
+            return False
+
+    async def get_unused_stock(self, category: str) -> dict | None:
+        """স্টক থেকে অব্যবহৃত একটি ফ্রেস অ্যাকাউন্ট নিয়ে আসে"""
+        try:
+            res = await self.client.table("stock_accounts") \
+                .select("*") \
+                .eq("category", category) \
+                .eq("is_used", False) \
+                .limit(1) \
+                .execute()
+            return res.data[0] if res.data else None
+        except Exception as e:
+            logger.error("Error fetching unused stock for %s: %s", category, e)
+            return None
+
+    async def mark_stock_as_used(self, stock_id: int, user_id: int) -> None:
+        """স্টক আইটেমটিকে used হিসেবে মার্ক করে যাতে অন্য কেউ না পায়"""
+        try:
+            await self.client.table("stock_accounts") \
+                .update({"is_used": True, "assigned_to": user_id}) \
+                .eq("id", stock_id) \
+                .execute()
+        except Exception as e:
+            logger.error("Error marking stock as used: %s", e)
+
+    # ------------------------------------------------------------------
+    # SUBMISSIONS & ADMIN REVIEWS
+    # ------------------------------------------------------------------
+    async def add_submission(self, user_id: int, category: str, data: str, status: str = "pending") -> int | None:
+        try:
+            res = await self.client.table("user_submissions").insert({
+                "user_id": user_id,
+                "category": category,
+                "details": data,
+                "status": status,
+            }).execute()
+            return res.data[0]["id"] if res.data else None
         except Exception as e:  # noqa: BLE001
             logger.error("Error saving %s submission: %s", category, e)
+            return None
+
+    async def update_submission_status(self, sub_id: str, status: str) -> bool:
+        try:
+            await self.client.table("user_submissions").update({"status": status}).eq("id", sub_id).execute()
+            return True
+        except Exception as e:
+            logger.error("Error updating submission status: %s", e)
             return False
+
+    async def get_accepted_submissions(self) -> list:
+        try:
+            res = await self.client.table("user_submissions").select("*").eq("status", "accepted").execute()
+            return res.data or []
+        except Exception as e:
+            logger.error("Error fetching accepted submissions: %s", e)
+            return []
+
+    async def add_user_balance(self, user_id: int, amount: float) -> bool:
+        status, _ = await self._apply_deltas(user_id, {"balance": amount})
+        return status == "ok"
 
     # ------------------------------------------------------------------
     # WITHDRAWALS
     # ------------------------------------------------------------------
     async def create_withdrawal(self, user_id: int, amount: float, method: str, account_no: str) -> tuple[str, dict | None]:
-        """Debit the balance and queue the request. Min-withdraw is re-read from
-        the DB here so an admin change is honoured even mid-flow.
-        Returns (status, row) with status 'ok' | 'below_min' | 'insufficient' | 'error'."""
         try:
             min_withdraw = await self.get_float_setting("min_withdraw", 50.0)
             if amount < min_withdraw:
@@ -476,8 +524,6 @@ class Database:
             return 0
 
     async def update_withdrawal_status(self, withdrawal_id: int, status: str) -> tuple[bool, dict | None]:
-        """pending -> approved|rejected exactly once. A rejection refunds the
-        amount (the ONLY place a refund happens, so it can never double-refund)."""
         try:
             res = (
                 await self.client.table("withdrawals").update({"status": status})
@@ -502,8 +548,6 @@ class Database:
     # SINGLE-INSTANCE LEASE (prevents TelegramConflictError on deploys)
     # ------------------------------------------------------------------
     async def acquire_leader(self) -> bool | None:
-        """True = we hold the lease, False = another live instance holds it,
-        None = lock table missing (run unprotected, see schema.sql)."""
         if not self._lock_available:
             return None
         now = int(time.time())
@@ -523,7 +567,7 @@ class Database:
             try:
                 await self.client.table("bot_lock").insert({"id": LOCK_ROW_ID, "owner": INSTANCE_ID, "heartbeat": now}).execute()
                 return True
-            except Exception:  # noqa: BLE001  (someone else inserted first)
+            except Exception:  # noqa: BLE001
                 return False
         except Exception as e:  # noqa: BLE001
             logger.warning("⚠️ bot_lock unavailable (%s) - running without single-instance protection.", e)
@@ -531,7 +575,6 @@ class Database:
             return None
 
     async def renew_leader(self) -> str:
-        """'ok' | 'lost' | 'error'"""
         try:
             res = (
                 await self.client.table("bot_lock")
