@@ -45,6 +45,7 @@ from keyboards import (
     safe_edit,
 )
 from tasks import task_manager
+from social_tasks import social_router
 from verifier import API_ERROR, UNSUPPORTED, inbox_verifier
 from withdraw import withdraw_router
 
@@ -472,6 +473,7 @@ def build_dispatcher() -> Dispatcher:
     dp.errors.register(on_error)
     dp.include_router(admin_router)
     dp.include_router(withdraw_router)
+    dp.include_router(social_router)
     dp.include_router(router)
     return dp
 
