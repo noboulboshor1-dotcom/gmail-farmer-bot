@@ -73,8 +73,14 @@ async def cmd_start(message: Message, state: FSMContext):
     await db.get_or_create_user(user_id=user_id, username=username, referred_by=referred_by)
 
     welcome_text = (
-        f"👋 স্বাগতম <b>{message.from_user.first_name}</b>!\n\n"
-        "🤖 এটি আপনার অল-ইন-ওয়ান প্রিমিয়াম ফার্মিং এবং আর্নিং বট।"
+        f"🌟 <b>স্বাগতম, {message.from_user.first_name}!</b>\n\n"
+        "🚀 <b>পেশাদার মাইক্রো-টাস্ক ও আর্নিং প্ল্যাটফর্মে আপনাকে স্বাগতম।</b>\n"
+        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন।\n\n"
+        "📌 <b>মূল বৈশিষ্ট্যসমূহ:</b>\n"
+        "▪️ দ্রুত ও অটোমেটেড জিমেইল ভেরিফিকেশন\n"
+        "▪️ ইনস্ট্যান্ট ডেইলি বোনাস ও রেফারেল কমিশন\n"
+        "▪️ নিরাপদ ও ঝামেলাহীন উইথড্রো সিস্টেম\n\n"
+        "👇 কাজ শুরু করতে নিচের মেনু থেকে অপশন নির্বাচন করুন:"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
