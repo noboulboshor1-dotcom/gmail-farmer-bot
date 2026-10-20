@@ -41,6 +41,8 @@ from keyboards import (
     BTN_REFERRALS,
     BTN_SUPPORT,
     BTN_TASKS,
+    BTN_PROFILE,
+    BTN_GIFTS,
     MENU_BUTTONS,
     get_cancel_keyboard,
     get_main_keyboard,
@@ -50,6 +52,12 @@ from tasks import task_manager
 from social_tasks import social_router
 from verifier import API_ERROR, UNSUPPORTED, inbox_verifier
 from withdraw import withdraw_router
+
+# নতুন মডিউলসমূহ ইমপোর্ট (প্রোফাইল, গিফট কোড, ভ্যালিডেটর এবং এডমিন সিএসভি)
+from validators import validate_task_submission
+from profile_handler import profile_router, format_profile_text, get_profile_keyboard
+from gift_codes_handler import gift_router, get_gift_keyboard
+from admin_csv_handler import admin_csv_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -100,7 +108,7 @@ class MenuResetMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 # ----------------------------------------------------------------------------
-# START / MENU
+# START / MENU & NEW BUTTONS HANDLERS
 # ----------------------------------------------------------------------------
 
 @router.message(CommandStart())
@@ -190,6 +198,27 @@ async def handle_iam_new(message: Message):
         reply_markup=get_main_keyboard(),
     )
 
+# নতুন যুক্ত হওয়া প্রোফাইল এবং গিফট কোড বাটন হ্যান্ডলার
+@router.message(F.text == BTN_PROFILE)
+async def handle_profile_button(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    stats = await db.get_user_stats(user_id)
+    text = format_profile_text(stats)
+    await message.answer(text, reply_markup=get_profile_keyboard())
+
+@router.message(F.text == BTN_GIFTS)
+async def handle_gifts_button(message: Message, state: FSMContext):
+    await state.clear()
+    text = (
+        "🎁 <b>গিফট কোড সিস্টেম</b>\n\n"
+        "আমাদের বিশেষ গিফট কোডগুলি রিডিম করুন এবং বোনাস পান!\n\n"
+        "• প্রতিটি কোড একবার ব্যবহার করা যায়\n"
+        "• কোডের মেয়াদ ৩০ দিন\n"
+        "• যেকোনো সময় রিডিম করতে পারেন"
+    )
+    await message.answer(text, reply_markup=get_gift_keyboard())
+
 # ----------------------------------------------------------------------------
 # ADMIN BULK STOCK UPLOAD (/addstock)
 # ----------------------------------------------------------------------------
@@ -240,7 +269,7 @@ async def process_stock_text_input(message: Message, state: FSMContext):
     )
 
 # ----------------------------------------------------------------------------
-# TASKS & CATEGORY SELECTION
+# TASKS & CATEGORY SELECTION (Gmail Task Submission with Validation)
 # ----------------------------------------------------------------------------
 
 @router.message(F.text == BTN_TASKS)
@@ -346,7 +375,7 @@ async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # ----------------------------------------------------------------------------
-# Gmail verification
+# Gmail verification (Enhanced with State Lock & Atomic Balance Updates)
 # ----------------------------------------------------------------------------
 
 @router.callback_query(F.data == "verify_task")
@@ -355,56 +384,64 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     if user_id in _verifying:
         await callback.answer("⏳ ভেরিফিকেশন চলছে, অপেক্ষা করুন...")
         return
+    
     _verifying.add(user_id)
-    try:
-        task = await db.get_user_assigned_task(user_id)
-        if not task:
+    lock = db.get_user_state_lock(user_id)
+    
+    async with lock:
+        try:
+            task = await db.get_user_assigned_task(user_id)
+            if not task:
+                await state.clear()
+                await callback.answer("⚠️ টাস্কটির মেয়াদ শেষ হয়ে গেছে। নতুন টাস্ক নিন।", show_alert=True)
+                await safe_edit(callback.message, "⚠️ টাস্কটির মেয়াদ শেষ হয়ে গেছে।")
+                await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
+                return
+
+            await callback.answer()
+            await safe_edit(callback.message, "🔍 ইনবক্স চেক করা হচ্ছে... দয়া করে অপেক্ষা করুন ⏳")
+            verified, code = await inbox_verifier.check_inbox(task["recovery"], task["email"])
+            if not verified:
+                if code == UNSUPPORTED:
+                    reason = "⚠️ এই টাস্কের রিকভারি মেইল অটো-ভেরিফাই সাপোর্ট করে না। সাপোর্টে যোগাযোগ করুন অথবা টাস্ক বাতিল করুন।"
+                elif code == API_ERROR:
+                    reason = "⚠️ ইনবক্স সার্ভিসে সাময়িক সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
+                else:
+                    reason = "গুগল থেকে রিকভারি মেইলে কনফার্মেশন মেসেজ আসেনি। আবার চেষ্টা করুন:"
+                await safe_edit(callback.message, _gmail_task_text(task) + f"\n\n❌ <b>ভেরিফিকেশন ব্যর্থ!</b>\n{reason}", _gmail_task_kb())
+                return
+
+            result = await db.complete_task(task["id"], user_id)
             await state.clear()
-            await callback.answer("⚠️ টাস্কটির মেয়াদ শেষ হয়ে গেছে। নতুন টাস্ক নিন।", show_alert=True)
-            await safe_edit(callback.message, "⚠️ টাস্কটির মেয়াদ শেষ হয়ে গেছে।")
+            if not result:
+                await safe_edit(callback.message, "⚠️ টাস্ক কমপ্লিট করতে সমস্যা হয়েছে। আবার চেষ্টা করুন বা সাপোর্টে জানান।")
+                await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
+                return
+
+            # সুরক্ষিত ও অ্যাটমিক ব্যালেন্স আপডেট ব্যবহার
+            reward = float(result.get('reward', CATEGORY_REWARDS["gmail"]))
+            await db.apply_balance_delta_safe(user_id, reward, reason=f"gmail_task_{task['id']}")
+
+            await safe_edit(
+                callback.message,
+                "🎉 <b>অভিনন্দন! আপনার টাস্ক সফলভাবে ভেরিফাই হয়েছে।</b>\n\n"
+                f"💰 ব্যালেন্সে যোগ হয়েছে: <b>+{reward:g} BDT</b>",
+            )
             await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
-            return
 
-        await callback.answer()
-        await safe_edit(callback.message, "🔍 ইনবক্স চেক করা হচ্ছে... দয়া করে অপেক্ষা করুন ⏳")
-        verified, code = await inbox_verifier.check_inbox(task["recovery"], task["email"])
-        if not verified:
-            if code == UNSUPPORTED:
-                reason = "⚠️ এই টাস্কের রিকভারি মেইল অটো-ভেরিফাই সাপোর্ট করে না। সাপোর্টে যোগাযোগ করুন অথবা টাস্ক বাতিল করুন।"
-            elif code == API_ERROR:
-                reason = "⚠️ ইনবক্স সার্ভিসে সাময়িক সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
-            else:
-                reason = "গুগল থেকে রিকভারি মেইলে কনফার্মেশন মেসেজ আসেনি। আবার চেষ্টা করুন:"
-            await safe_edit(callback.message, _gmail_task_text(task) + f"\n\n❌ <b>ভেরিফিকেশন ব্যর্থ!</b>\n{reason}", _gmail_task_kb())
-            return
-
-        result = await db.complete_task(task["id"], user_id)
-        await state.clear()
-        if not result:
-            await safe_edit(callback.message, "⚠️ টাস্ক কমপ্লিট করতে সমস্যা হয়েছে। আবার চেষ্টা করুন বা সাপোর্টে জানান।")
-            await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
-            return
-
-        await safe_edit(
-            callback.message,
-            "🎉 <b>অভিনন্দন! আপনার টাস্ক সফলভাবে ভেরিফাই হয়েছে।</b>\n\n"
-            f"💰 ব্যালেন্সে যোগ হয়েছে: <b>+{result['reward']:g} BDT</b>",
-        )
-        await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
-
-        if result["referrer_id"] and result["commission"] > 0:
-            try:
-                await callback.bot.send_message(
-                    result["referrer_id"],
-                    f"🎁 আপনার রেফারেল টাস্ক সম্পন্ন করেছে! কমিশন: <b>+{result['commission']:.4f} BDT</b>",
-                )
-            except Exception as e:
-                logger.info("Referrer %s not notified: %s", result["referrer_id"], e)
-    finally:
-        _verifying.discard(user_id)
+            if result.get("referrer_id") and result.get("commission", 0) > 0:
+                try:
+                    await callback.bot.send_message(
+                        result["referrer_id"],
+                        f"🎁 আপনার রেফারেল টাস্ক সম্পন্ন করেছে! কমিশন: <b>+{result['commission']:.4f} BDT</b>",
+                    )
+                except Exception as e:
+                    logger.info("Referrer %s not notified: %s", result["referrer_id"], e)
+        finally:
+            _verifying.discard(user_id)
 
 # ----------------------------------------------------------------------------
-# Facebook Submissions & Admin Review Flow
+# Facebook Submissions & Admin Review Flow (With Input Validation)
 # ----------------------------------------------------------------------------
 
 @router.callback_query(F.data == "prompt_fb_uid")
@@ -415,7 +452,14 @@ async def handle_prompt_fb_uid(callback: CallbackQuery):
 @router.message(TaskStates.waiting_for_fb_uid, F.text)
 async def process_fb_uid_submission(message: Message, state: FSMContext):
     uid_text = message.text.strip()
-    if uid_text.isdigit() and 14 <= len(uid_text) <= 16:
+    
+    # ভ্যালিডেটর ব্যবহার করে ইনপুট চেক করা
+    is_valid, error_msg, cleaned_data = await validate_task_submission(
+        task_category="facebook",
+        submission_data={"uid": uid_text, "cookies": "dummy_cookie_placeholder"},
+    )
+    
+    if is_valid or (uid_text.isdigit() and 14 <= len(uid_text) <= 16):
         await state.update_data(fb_uid=uid_text)
         await state.set_state(TaskStates.waiting_for_fb_cookies)
         await message.answer("📘 Now enter your Facebook account Cookies:", reply_markup=get_cancel_keyboard())
@@ -534,7 +578,7 @@ async def handle_accept_submission(callback: CallbackQuery):
     reward = CATEGORY_REWARDS.get("facebook", 4.0) if cat_type == "fb" else CATEGORY_REWARDS.get("instagram", 5.0)
 
     await db.update_submission_status(sub_id, "accepted")
-    await db.add_user_balance(user_id, reward)
+    await db.apply_balance_delta_safe(user_id, reward, reason=f"submission_accept_{sub_id}")
     await safe_edit(callback.message, callback.message.text + "\n\n✅ <b>ACCEPTED & REWARDED</b>")
     await callback.answer("Accepted!", show_alert=True)
     try:
@@ -649,7 +693,7 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 # ----------------------------------------------------------------------------
-# SINGLE-INSTANCE POLLING
+# SINGLE-INSTANCE POLLING & ROUTER REGISTRATION
 # ----------------------------------------------------------------------------
 
 def build_dispatcher() -> Dispatcher:
@@ -658,6 +702,12 @@ def build_dispatcher() -> Dispatcher:
     dp.callback_query.outer_middleware(BanMiddleware())
     dp.message.outer_middleware(MenuResetMiddleware())
     dp.errors.register(on_error)
+    
+    # নতুন রাউটারগুলো এখানে সংযুক্ত করা হলো
+    dp.include_router(profile_router)
+    dp.include_router(gift_router)
+    dp.include_router(admin_csv_router)
+    
     dp.include_router(admin_router)
     dp.include_router(withdraw_router)
     dp.include_router(social_router)
