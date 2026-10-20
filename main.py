@@ -57,7 +57,6 @@ logger = logging.getLogger(__name__)
 router = Router(name="user")
 _verifying: set[int] = set()
 
-
 class TaskStates(StatesGroup):
     working_on_gmail = State()
     waiting_for_fb_uid = State()
@@ -65,14 +64,11 @@ class TaskStates(StatesGroup):
     waiting_for_insta_2fa = State()
     waiting_for_reject_reason = State()
 
-
 class AdminStates(StatesGroup):
     waiting_for_stock_data = State()
 
-
 def _fmt(x) -> str:
     return f"{float(x):.2f}"
-
 
 def parse_credentials(stock_string):
     if ":" in stock_string:
@@ -80,10 +76,10 @@ def parse_credentials(stock_string):
         return u.strip(), p.strip()
     return stock_string, "N/A"
 
-
 # ----------------------------------------------------------------------------
 # MIDDLEWARES
 # ----------------------------------------------------------------------------
+
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
@@ -91,10 +87,9 @@ class BanMiddleware(BaseMiddleware):
             if isinstance(event, CallbackQuery):
                 await event.answer("🚫 আপনার অ্যাকাউন্টটি ব্যান করা হয়েছে!", show_alert=True)
             elif isinstance(event, Message):
-                await event.answer("🚫 <b>আপনার অ্যাকাউন্টটি ব্যান করা হয়েছে!</b>")
+                await event.answer("🚫 আপনার অ্যাকাউন্টটি ব্যান করা হয়েছে!")
             return None
         return await handler(event, data)
-
 
 class MenuResetMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data):
@@ -104,10 +99,10 @@ class MenuResetMiddleware(BaseMiddleware):
                 await state.clear()
         return await handler(event, data)
 
-
 # ----------------------------------------------------------------------------
 # START / MENU
 # ----------------------------------------------------------------------------
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -121,11 +116,10 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
             referred_by = ref_id
 
     await db.get_or_create_user(user_id=user_id, username=username, referred_by=referred_by)
-
     await message.answer(
         f"🌟 <b>স্বাগতম, {html.escape(message.from_user.first_name)}!</b>\n\n"
         "🚀 <b>পেশাদার মাইক্রো-টাস্ক ও আর্নিং প্ল্যাটফর্মে আপনাকে স্বাগতম।</b>\n"
-        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন।\n\n"
+        "আমাদের এই অটোমেটেড সিস্টেমের মাধ্যমে আপনি খুব সহজেই বিভিন্ন টাস্ক সম্পন্ন করে প্রতিদিন নিশ্চিত আয় করতে পারবেন。\n\n"
         "📌 <b>মূল বৈশিষ্ট্যসমূহ:</b>\n"
         "▪️ দ্রুত ও অটোমেটেড জিমেইল ভেরিফিকেশন\n"
         "▪️ ইনস্ট্যান্ট ডেইলি বোনাস ও রেফারেল কমিশন\n"
@@ -134,32 +128,28 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         reply_markup=get_main_keyboard(),
     )
 
-
 @router.message(F.text == BTN_CANCEL)
 async def handle_cancel_button(message: Message, state: FSMContext):
     await state.clear()
     await db.release_user_task(message.from_user.id)
     await message.answer("❌ কাজ বাতিল করা হয়েছে।", reply_markup=get_main_keyboard())
 
-
 @router.message(F.text == BTN_BONUS)
 async def handle_daily_bonus(message: Message):
     _, msg, _ = await db.claim_daily_bonus(message.from_user.id)
     await message.answer(msg, reply_markup=get_main_keyboard())
-
 
 @router.message(F.text == BTN_BALANCE)
 async def handle_balance_btn(message: Message):
     user_id = message.from_user.id
     user = await db.get_or_create_user(user_id, message.from_user.username or "")
     await message.answer(
-        "💰 <b>আপনার ব্যালেন্স একাউন্ট ইনফো:</b>\n\n"
-        f"🆔 ইউজার আইডি: <code>{user_id}</code>\n"
-        f"💵 মূল ব্যালেন্স: <b>{_fmt(user.get('balance') or 0)} BDT</b>\n"
-        f"✅ সফল টাস্ক সম্পন্ন: <b>{int(user.get('completed_tasks') or 0)} টি</b>",
+        "💰 আপনার ব্যালেন্স একাউন্ট ইনফো:\n\n"
+        f"🆔 ইউজার আইডি: {user_id}\n"
+        f"💵 মূল ব্যালেন্স: {_fmt(user.get('balance') or 0)} BDT\n"
+        f"✅ সফল টাস্ক সম্পন্ন: {int(user.get('completed_tasks') or 0)} টি",
         reply_markup=get_main_keyboard(),
     )
-
 
 @router.message(F.text == BTN_REFERRALS)
 async def handle_referral(message: Message):
@@ -180,42 +170,40 @@ async def handle_referral(message: Message):
         reply_markup=kb,
     )
 
-
 @router.message(F.text == BTN_SUPPORT)
 async def handle_support(message: Message):
     await message.answer(
-        "🎧 <b>সাপোর্ট ও হেল্প সেন্টার</b>\n\n"
+        "🎧 সাপোর্ট ও হেল্প সেন্টার\n\n"
         "যেকোনো প্রয়োজনে আমাদের সাপোর্ট টিমের সাথে যোগাযোগ করুন:\n"
         f"👉 এডমিন সাপোর্ট: {html.escape(SUPPORT_USERNAME)}",
         reply_markup=get_main_keyboard(),
     )
 
-
 @router.message(F.text == BTN_NEW)
 async def handle_iam_new(message: Message):
     await message.answer(
-        "💡 <b>নতুনদের জন্য নির্দেশিকা:</b>\n\n"
-        "১. <b>Tasks ▸</b> থেকে পছন্দের টাস্ক নিন।\n"
+        "💡 নতুনদের জন্য নির্দেশিকা:\n\n"
+        "১. Tasks ▸ থেকে পছন্দের টাস্ক নিন।\n"
         "২. জিমেইল টাস্কে রিকভারি মেইল বসিয়ে অটোভেরিফাই করুন।\n"
         "৩. ফেসবুক ও ইনস্টাগ্রাম টাস্কে আইডি/2FA কী সাবমিট করুন।\n"
-        "৪. প্রতিদিন <b>Daily Bonus</b> দাবি করুন!",
+        "৪. প্রতিদিন Daily Bonus দাবি করুন!",
         reply_markup=get_main_keyboard(),
     )
-
 
 # ----------------------------------------------------------------------------
 # ADMIN BULK STOCK UPLOAD (/addstock)
 # ----------------------------------------------------------------------------
+
 @router.message(Command("addstock"))
 async def handle_addstock_start(message: Message, command: CommandObject, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    
+
     args = command.args.strip().lower() if command.args else ""
     if args not in ["facebook", "instagram"]:
         await message.answer("⚠️ সঠিক নিয়মে ব্যবহার করুন:\n👉 <code>/addstock facebook</code> অথবা\n👉 <code>/addstock instagram</code> লিখে সেন্ড করুন।")
         return
-    
+
     await state.set_state(AdminStates.waiting_for_stock_data)
     await state.update_data(stock_category=args)
     await message.answer(
@@ -223,12 +211,11 @@ async def handle_addstock_start(message: Message, command: CommandObject, state:
         "📝 এখন আপনার একাউন্ট বা টাস্কগুলোর লিস্ট (প্রতি লাইনে একটি করে) কপি করে এই চ্যাটে পেস্ট করে পাঠিয়ে দিন:"
     )
 
-
 @router.message(AdminStates.waiting_for_stock_data, F.text)
 async def process_stock_text_input(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    
+
     if message.text in MENU_BUTTONS:
         await state.clear()
         return
@@ -236,16 +223,15 @@ async def process_stock_text_input(message: Message, state: FSMContext):
     data = await state.get_data()
     category = data.get("stock_category")
     await state.clear()
-    
+
     lines = message.text.strip().split('\n')
     added_count = 0
-    
     for line in lines:
         line_data = line.strip()
         if line_data:
             await db.add_stock_account(category=category, account_data=line_data)
             added_count += 1
-            
+
     await message.answer(
         f"✅ <b>সফলভাবে স্টক যুক্ত হয়েছে!</b>\n\n"
         f"📂 ক্যাটাগরি: <code>{category}</code>\n"
@@ -253,22 +239,22 @@ async def process_stock_text_input(message: Message, state: FSMContext):
         reply_markup=get_main_keyboard()
     )
 
-
 # ----------------------------------------------------------------------------
 # TASKS & CATEGORY SELECTION
 # ----------------------------------------------------------------------------
+
 @router.message(F.text == BTN_TASKS)
 async def handle_tasks_menu(message: Message):
+    categories = await db.get_categories()
     rows = [
         [InlineKeyboardButton(text=cat["category_name"], callback_data=f"cat_task_{cat['category_key']}")]
-        for cat in await db.get_categories() if cat.get("is_enabled")
+        for cat in categories if cat.get("is_enabled")
     ]
     if not rows:
         await message.answer("⚠️ বর্তমানে সকল টাস্ক ক্যাটাগরি সাময়িকভাবে বন্ধ রয়েছে।", reply_markup=get_main_keyboard())
         return
     rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")])
-    await message.answer("🎯 <b>কাজের ক্যাটাগরি নির্বাচন করুন:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
+    await message.answer("🎯 কাজের ক্যাটাগরি নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 def _gmail_task_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -276,20 +262,18 @@ def _gmail_task_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")],
     ])
 
-
 def _gmail_task_text(task: dict) -> str:
     first, last = task_manager.display_names(task)
     reward_amount = CATEGORY_REWARDS["gmail"]
     return (
-        "✏️ <b>নিচে দেওয়া তথ্য দিয়ে জিমেইল একাউন্ট তৈরি করুন:</b>\n\n"
-        f"👤 <b>First Name:</b> <code>{html.escape(first)}</code>\n"
-        f"👤 <b>Last Name:</b> <code>{html.escape(last)}</code>\n"
-        f"📧 <b>Email:</b> <code>{html.escape(task['email'])}</code>\n"
-        f"🔑 <b>Password:</b> <code>{html.escape(task['password'])}</code>\n\n"
-        f"🛡️ <b>Recovery Email:</b>\n<code>{html.escape(task['recovery'])}</code>\n"
-        f"💰 <b>রিওয়ার্ড:</b> <code>{reward_amount:.2f} BDT</code>"
+        "✏️ নিচে দেওয়া তথ্য দিয়ে জিমেইল একাউন্ট তৈরি করুন:\n\n"
+        f"👤 First Name: {html.escape(first)}\n"
+        f"👤 Last Name: {html.escape(last)}\n"
+        f"📧 Email: {html.escape(task['email'])}\n"
+        f"🔑 Password: {html.escape(task['password'])}\n\n"
+        f"🛡️ Recovery Email:\n{html.escape(task['recovery'])}\n"
+        f"💰 রিওয়ার্ড: {reward_amount:.2f} BDT"
     )
-
 
 @router.callback_query(F.data.startswith("cat_task_"))
 async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
@@ -308,7 +292,6 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(TaskStates.working_on_gmail)
         await safe_edit(callback.message, _gmail_task_text(task), _gmail_task_kb())
         await callback.message.answer("⚠️ সঠিকভাবে কাজটি সম্পাদন করুন!", reply_markup=get_cancel_keyboard())
-
     elif cat_key == "facebook":
         fb_reward = CATEGORY_REWARDS.get("facebook", 4.0)
         await state.set_state(TaskStates.waiting_for_fb_uid)
@@ -316,8 +299,6 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Send UID", callback_data="prompt_fb_uid")],
             [InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]
         ])
-        
-        # ইউজারকে First Name, Last Name, Password প্রদর্শন করা
         text = (
             "📘 <b>Facebook Account Task</b>\n\n"
             f"👤 <b>First Name:</b> <code>{html.escape(FB_FIRST_NAME)}</code>\n"
@@ -328,18 +309,15 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         )
         await safe_edit(callback.message, text, kb)
         await callback.message.answer("⚠️ ইউআইডি টাইপ করে পাঠাতে পারেন অথবা নিচে ক্যানসেল করতে পারেন:", reply_markup=get_cancel_keyboard())
-
     elif cat_key == "instagram":
         stock_item = await db.get_unused_stock("instagram")
         if not stock_item:
             await callback.answer("⚠️ দুঃখিত! বর্তমানে ইনস্টাগ্রামের কোনো কাজ এভেলেবল নেই।", show_alert=True)
             return
-
         username, password = parse_credentials(stock_item['account_data'])
         await db.mark_stock_as_used(stock_item['id'], user_id=user_id)
         await state.set_state(TaskStates.waiting_for_insta_2fa)
         await state.update_data(insta_user=username, insta_pass=password)
-
         insta_reward = CATEGORY_REWARDS.get("instagram", 5.0)
         text = (
             "📸 <b>Instagram Account Task</b>\n\n"
@@ -354,12 +332,10 @@ async def handle_category_selection(callback: CallbackQuery, state: FSMContext):
         ])
         await safe_edit(callback.message, text, kb)
         await callback.message.answer("⚠️ আপনার 2FA Key পেস্ট করে সেন্ড করুন:", reply_markup=get_cancel_keyboard())
-
     else:
         await callback.answer("⚠️ এই ক্যাটাগরির কাজ বর্তমানে স্টকে নেই।", show_alert=True)
         return
     await callback.answer()
-
 
 @router.callback_query(F.data == "cancel_task")
 async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
@@ -369,8 +345,10 @@ async def handle_cancel_task(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("প্রধান মেনু:", reply_markup=get_main_keyboard())
     await callback.answer()
 
+# ----------------------------------------------------------------------------
+# Gmail verification
+# ----------------------------------------------------------------------------
 
-# --- Gmail verification ------------------------------------------------------
 @router.callback_query(F.data == "verify_task")
 async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -390,7 +368,6 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         await safe_edit(callback.message, "🔍 ইনবক্স চেক করা হচ্ছে... দয়া করে অপেক্ষা করুন ⏳")
         verified, code = await inbox_verifier.check_inbox(task["recovery"], task["email"])
-
         if not verified:
             if code == UNSUPPORTED:
                 reason = "⚠️ এই টাস্কের রিকভারি মেইল অটো-ভেরিফাই সাপোর্ট করে না। সাপোর্টে যোগাযোগ করুন অথবা টাস্ক বাতিল করুন।"
@@ -426,13 +403,14 @@ async def handle_verify_task(callback: CallbackQuery, state: FSMContext):
     finally:
         _verifying.discard(user_id)
 
+# ----------------------------------------------------------------------------
+# Facebook Submissions & Admin Review Flow
+# ----------------------------------------------------------------------------
 
-# --- Facebook Submissions & Admin Review Flow ---------------------------------
 @router.callback_query(F.data == "prompt_fb_uid")
 async def handle_prompt_fb_uid(callback: CallbackQuery):
-    await callback.message.answer("🏷️ <b>Enter your Facebook account 14-16 digit UID:</b>", reply_markup=get_cancel_keyboard())
+    await callback.message.answer("🏷️ Enter your Facebook account 14-16 digit UID:", reply_markup=get_cancel_keyboard())
     await callback.answer()
-
 
 @router.message(TaskStates.waiting_for_fb_uid, F.text)
 async def process_fb_uid_submission(message: Message, state: FSMContext):
@@ -440,16 +418,15 @@ async def process_fb_uid_submission(message: Message, state: FSMContext):
     if uid_text.isdigit() and 14 <= len(uid_text) <= 16:
         await state.update_data(fb_uid=uid_text)
         await state.set_state(TaskStates.waiting_for_fb_cookies)
-        await message.answer("📘 <b>Now enter your Facebook account Cookies:</b>", reply_markup=get_cancel_keyboard())
+        await message.answer("📘 Now enter your Facebook account Cookies:", reply_markup=get_cancel_keyboard())
     else:
         await message.answer("⚠️ সঠিক 14-16 ডিজিটের Facebook UID দিন।", reply_markup=get_cancel_keyboard())
-
 
 @router.message(TaskStates.waiting_for_fb_cookies, F.text)
 async def process_fb_cookies_submission(message: Message, state: FSMContext):
     cookies_text = message.text.strip()
     if len(cookies_text) <= 10:
-        await message.answer("⚠️ <b>Invalid Cookies!</b> Please paste complete cookies.", reply_markup=get_cancel_keyboard())
+        await message.answer("⚠️ Invalid Cookies! Please paste complete cookies.", reply_markup=get_cancel_keyboard())
         return
 
     data = await state.get_data()
@@ -463,10 +440,11 @@ async def process_fb_cookies_submission(message: Message, state: FSMContext):
     await state.clear()
 
     sub_id = await db.add_submission(
-        user_id=user_id, category="facebook",
-        data=f"UID: {fb_uid} | Cookies: {cookies_text}", status="pending"
+        user_id=user_id,
+        category="facebook",
+        data=f"UID: {fb_uid} | Cookies: {cookies_text}",
+        status="pending"
     )
-
     await message.answer(
         "⏳ <b>আপনার ফেসবুক কাজ জমা নেওয়া হয়েছে!</b>\n\n"
         "একাউন্টটি রিভিউর জন্য পেন্ডিং রয়েছে। এডমিন চেক করে এপ্রুভ করলেই ব্যালেন্সে রিওয়ার্ড জমা হবে।",
@@ -490,18 +468,19 @@ async def process_fb_cookies_submission(message: Message, state: FSMContext):
         except Exception:
             pass
 
+# ----------------------------------------------------------------------------
+# Instagram Submissions & Admin Review Flow
+# ----------------------------------------------------------------------------
 
-# --- Instagram Submissions & Admin Review Flow --------------------------------
 @router.callback_query(F.data == "prompt_insta_2fa")
 async def handle_prompt_insta_2fa(callback: CallbackQuery):
     await safe_edit(
         callback.message,
-        "🔑 <b>Enter 2FA Secret Key:</b> ⤵️",
+        "🔑 Enter 2FA Secret Key: ⤵️",
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel Task", callback_data="cancel_task")]])
     )
     await callback.message.answer("⚠️ আপনার 2FA Key পেস্ট করে সেন্ড করুন:", reply_markup=get_cancel_keyboard())
     await callback.answer()
-
 
 @router.message(TaskStates.waiting_for_insta_2fa, F.text)
 async def process_insta_2fa_submission(message: Message, state: FSMContext):
@@ -513,10 +492,11 @@ async def process_insta_2fa_submission(message: Message, state: FSMContext):
     await state.clear()
 
     sub_id = await db.add_submission(
-        user_id=user_id, category="instagram",
-        data=f"Username: {username} | Pass: {password} | 2FA: {key_text}", status="pending"
+        user_id=user_id,
+        category="instagram",
+        data=f"Username: {username} | Pass: {password} | 2FA: {key_text}",
+        status="pending"
     )
-
     await message.answer(
         "⏳ <b>আপনার ইনস্টাগ্রাম কাজ জমা নেওয়া হয়েছে!</b>\n\n"
         "একাউন্টটি রিভিউর জন্য পেন্ডিং রয়েছে। এডমিন চেক করে একসেপ্ট করলেই ব্যালেন্সে রিওয়ার্ড জমা হবে।",
@@ -541,10 +521,10 @@ async def process_insta_2fa_submission(message: Message, state: FSMContext):
         except Exception:
             pass
 
-
 # ----------------------------------------------------------------------------
 # ADMIN ACCEPT / REJECT & FILE EXPORT (/export_accounts)
 # ----------------------------------------------------------------------------
+
 @router.callback_query(F.data.startswith("app_sub_"))
 async def handle_accept_submission(callback: CallbackQuery):
     parts = callback.data.split("_")
@@ -566,22 +546,19 @@ async def handle_accept_submission(callback: CallbackQuery):
     except Exception:
         pass
 
-
 @router.callback_query(F.data.startswith("rej_sub_"))
 async def handle_reject_prompt(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     sub_id = parts[2]
     user_id = int(parts[3])
-    
+
     await state.set_state(TaskStates.waiting_for_reject_reason)
     await state.update_data(target_sub_id=sub_id, target_user_id=user_id)
-
     await callback.message.reply(
         "📝 <b>রিজেক্ট করার কারণ টাইপ করুন:</b>\n"
         "(ডিফল্ট মেসেজ পাঠাতে <code>default</code> লিখুন)"
     )
     await callback.answer()
-
 
 @router.message(TaskStates.waiting_for_reject_reason, F.text)
 async def process_reject_reason(message: Message, state: FSMContext):
@@ -597,9 +574,7 @@ async def process_reject_reason(message: Message, state: FSMContext):
 
     await db.update_submission_status(sub_id, "rejected")
     await state.clear()
-
     await message.answer("❌ টাস্ক বাতিল করা হয়েছে এবং কারণসহ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।")
-
     try:
         await message.bot.send_message(
             user_id,
@@ -609,7 +584,6 @@ async def process_reject_reason(message: Message, state: FSMContext):
         )
     except Exception:
         pass
-
 
 @router.message(Command("export_accounts"))
 async def export_accepted_accounts(message: Message):
@@ -626,27 +600,27 @@ async def export_accepted_accounts(message: Message):
     document = BufferedInputFile(file_bytes.getvalue(), filename="accounts_list.txt")
     await message.answer_document(
         document=document,
-        caption="📄 <b>একসেপ্ট হওয়া সকল অ্যাকাউন্টের লিস্ট টেক্সট ফাইল আকারে দেওয়া হলো!</b>"
+        caption="📄 একসেপ্ট হওয়া সকল অ্যাকাউন্টের লিস্ট টেক্সট ফাইল আকারে দেওয়া হলো!"
     )
-
 
 # ----------------------------------------------------------------------------
 # UNKNOWN COMMAND FALLBACK HANDLER
 # ----------------------------------------------------------------------------
+
 @router.message()
 async def unknown_command_handler(message: Message):
     await message.answer(
-        "┏ ⚠️ <b>অপরিচিত কমান্ড বা বার্তা!</b>\n"
+        "┏ ⚠️ অপরিচিত কমান্ড বা বার্তা!\n"
         "┃\n"
         "┣ ❌ দুঃখিত, আপনার পাঠানো লেখা বা কমান্ডটি আমি বুঝতে পারিনি।\n"
         "┗ 💡 দয়া করে নিচের মেনু ব্যবহার করুন অথবা বট রিফ্রেশ করতে /start লিখুন।",
         parse_mode="HTML"
     )
 
-
 # ----------------------------------------------------------------------------
 # GLOBAL ERROR HANDLER
 # ----------------------------------------------------------------------------
+
 async def on_error(event: ErrorEvent) -> bool:
     logger.error("Unhandled error: %s", event.exception, exc_info=event.exception)
     update = event.update
@@ -657,13 +631,12 @@ async def on_error(event: ErrorEvent) -> bool:
             await update.message.answer("⚠️ একটি সমস্যা হয়েছে, আবার চেষ্টা করুন।")
     return True
 
-
 # ----------------------------------------------------------------------------
 # WEB SERVER (Render health check)
 # ----------------------------------------------------------------------------
+
 async def handle_web(_request: web.Request) -> web.Response:
     return web.Response(text="Super Premium Farmer Bot Live! 🚀")
-
 
 async def start_web_server() -> web.AppRunner:
     app = web.Application()
@@ -675,10 +648,10 @@ async def start_web_server() -> web.AppRunner:
     logger.info("🌐 Server running on port %s", PORT)
     return runner
 
-
 # ----------------------------------------------------------------------------
 # SINGLE-INSTANCE POLLING
 # ----------------------------------------------------------------------------
+
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.message.outer_middleware(BanMiddleware())
@@ -690,7 +663,6 @@ def build_dispatcher() -> Dispatcher:
     dp.include_router(social_router)
     dp.include_router(router)
     return dp
-
 
 async def leader_keeper(dp: Dispatcher, lost: asyncio.Event) -> None:
     last_ok = time.monotonic()
@@ -706,7 +678,6 @@ async def leader_keeper(dp: Dispatcher, lost: asyncio.Event) -> None:
             with contextlib.suppress(Exception):
                 await dp.stop_polling()
             return
-
 
 async def run_polling(bot: Bot, dp: Dispatcher, stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
@@ -745,13 +716,11 @@ async def run_polling(bot: Bot, dp: Dispatcher, stop_event: asyncio.Event) -> No
         finally:
             if keeper:
                 keeper.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await keeper
-
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await keeper
         if not lost.is_set():
             break
         logger.warning("Lease lost - going back to the queue.")
-
 
 async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -774,7 +743,6 @@ async def main() -> None:
         await bot.session.close()
         await runner.cleanup()
         logger.info("Bot stopped cleanly.")
-
 
 if __name__ == "__main__":
     try:
