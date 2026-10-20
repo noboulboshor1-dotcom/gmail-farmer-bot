@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import math
@@ -6,6 +5,7 @@ import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from collections import defaultdict
 
 from supabase import AsyncClient, acreate_client
 
@@ -41,6 +41,7 @@ class Database:
         self.client: Optional[AsyncClient] = None
         self._ban_cache: dict[int, tuple[float, bool]] = {}
         self._lock_available = True
+        self._state_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)  # FSM state locking per user
 
     # ================================================================
     # CONNECTION
@@ -64,6 +65,14 @@ class Database:
                 "Database is not connected. Call await db.connect() first."
             )
         return self.client
+
+    # ================================================================
+    # FSM STATE LOCKING (prevent concurrent task processing)
+    # ================================================================
+
+    def get_user_state_lock(self, user_id: int) -> asyncio.Lock:
+        """Get or create a state lock for a user to prevent concurrent task processing."""
+        return self._state_locks[user_id]
 
     # ================================================================
     # SETTINGS
@@ -100,105 +109,48 @@ class Database:
         except (TypeError, ValueError, AttributeError):
             return default
 
-    async def update_setting(self, key: str, value: str) -> bool:
+    async def set_setting(self, key: str, value: str) -> bool:
         try:
             await self._db().table("settings").upsert(
-                {"key": key, "value": str(value)},
-                on_conflict="key",
+                {"key": key, "value": value}
             ).execute()
             return True
         except Exception:
-            logger.exception("Error updating setting %s", key)
+            logger.exception("Error setting %s", key)
             return False
 
     # ================================================================
-    # CATEGORIES
-    # ================================================================
-
-    async def get_categories(self) -> list[dict]:
-        try:
-            res = await self._db().table(
-                "task_categories"
-            ).select("*").order("category_key").execute()
-            return res.data or []
-        except Exception:
-            logger.exception("Error fetching categories")
-            return []
-
-    async def is_category_enabled(self, cat_key: str) -> bool:
-        try:
-            res = await self._db().table(
-                "task_categories"
-            ).select("is_enabled").eq(
-                "category_key", cat_key
-            ).limit(1).execute()
-
-            return bool(
-                res.data and res.data[0].get("is_enabled", False)
-            )
-        except Exception:
-            logger.exception("Error checking category %s", cat_key)
-            return False
-
-    async def toggle_category(self, cat_key: str) -> Optional[bool]:
-        try:
-            res = await self._db().table(
-                "task_categories"
-            ).select("is_enabled").eq(
-                "category_key", cat_key
-            ).limit(1).execute()
-
-            if not res.data:
-                return None
-
-            new_value = not bool(res.data[0].get("is_enabled"))
-            updated = await self._db().table(
-                "task_categories"
-            ).update(
-                {"is_enabled": new_value}
-            ).eq(
-                "category_key", cat_key
-            ).select("*").execute()
-
-            return new_value if updated.data else None
-        except Exception:
-            logger.exception("Error toggling category %s", cat_key)
-            return None
-
-    # ================================================================
-    # USERS
+    # USER MANAGEMENT
     # ================================================================
 
     async def get_user(self, user_id: int) -> Optional[dict]:
-        res = await self._db().table("users").select(
-            "*"
-        ).eq("user_id", user_id).limit(1).execute()
+        try:
+            res = await self._db().table("users").select(
+                "*"
+            ).eq("user_id", user_id).limit(1).execute()
 
-        return res.data[0] if res.data else None
+            return res.data[0] if res.data else None
+        except Exception:
+            logger.exception("Error fetching user %s", user_id)
+            return None
 
     async def get_or_create_user(
         self,
         user_id: int,
-        username: str = "",
+        username: Optional[str] = None,
         referred_by: Optional[int] = None,
     ) -> dict:
-        try:
-            existing = await self.get_user(user_id)
+        user = await self.get_user(user_id)
+        if user:
+            return user
 
-            if existing:
-                if username and existing.get("username") != username:
-                    await self._db().table("users").update(
-                        {"username": username}
-                    ).eq("user_id", user_id).execute()
-                    existing["username"] = username
-
-                return existing
-
-            valid_referrer = None
-            if referred_by and referred_by != user_id:
-                referrer = await self.get_user(referred_by)
-                if referrer:
+        valid_referrer = None
+        if referred_by and referred_by != user_id:
+            try:
+                if referrer := await self.get_user(referred_by):
                     valid_referrer = referred_by
+            except Exception:
+                pass
 
             user_data = {
                 "user_id": user_id,
@@ -216,8 +168,6 @@ class Database:
                     "users"
                 ).insert(user_data).execute()
             except Exception:
-                # Concurrent registration হলে duplicate row এড়ায়,
-                # যদি user_id কলামটি UNIQUE হয়।
                 existing = await self.get_user(user_id)
                 if existing:
                     return existing
@@ -243,21 +193,18 @@ class Database:
                 "is_banned": False,
             }
 
-    async def increment_referral_count(self, referrer_id: int) -> bool:
-        status, _ = await self._apply_deltas(
-            referrer_id,
-            {"referral_count": 1},
-        )
-        return status == "ok"
-
     async def get_user_stats(self, user_id: int) -> dict:
+        """Get comprehensive user profile stats."""
         defaults = {
+            "user_id": user_id,
             "balance": 0.0,
             "completed_tasks": 0,
             "pending_tasks": 0,
             "rejected_tasks": 0,
             "referral_count": 0,
             "referral_income": 0.0,
+            "username": "Unknown",
+            "referred_by": None,
         }
 
         try:
@@ -278,12 +225,15 @@ class Database:
             ).eq("status", "rejected").execute()
 
             return {
+                "user_id": user_id,
                 "balance": float(user.get("balance") or 0),
                 "completed_tasks": int(user.get("completed_tasks") or 0),
                 "pending_tasks": int(pending.count or 0),
                 "rejected_tasks": int(rejected.count or 0),
                 "referral_count": int(user.get("referral_count") or 0),
                 "referral_income": float(user.get("referral_income") or 0),
+                "username": user.get("username", "Unknown"),
+                "referred_by": user.get("referred_by"),
             }
         except Exception:
             logger.exception("Error fetching stats for %s", user_id)
@@ -308,7 +258,6 @@ class Database:
             return banned
         except Exception:
             logger.exception("Error checking ban status for %s", user_id)
-            # Database error হলে ভুল করে banned নয় বলা এড়ানো।
             return True
 
     async def set_user_ban_status(
@@ -330,68 +279,8 @@ class Database:
             logger.exception("Error changing ban status")
             return False
 
-    async def get_users_paginated(
-        self,
-        page: int = 1,
-        limit: int = 6,
-    ) -> tuple[list[dict], int]:
-        page = max(1, page)
-        limit = max(1, min(limit, 100))
-        start = (page - 1) * limit
-
-        try:
-            res = await self._db().table("users").select(
-                "user_id, username, balance, is_banned, completed_tasks",
-                count="exact",
-            ).order("user_id").range(
-                start, start + limit - 1
-            ).execute()
-
-            return res.data or [], int(res.count or 0)
-        except Exception:
-            logger.exception("Error fetching users page")
-            return [], 0
-
-    async def get_all_users_count(self) -> int:
-        try:
-            res = await self._db().table("users").select(
-                "user_id", count="exact"
-            ).limit(1).execute()
-            return int(res.count or 0)
-        except Exception:
-            logger.exception("Error counting users")
-            return 0
-
-    async def get_broadcast_user_ids(self) -> list[int]:
-        ids = []
-        start, size = 0, 1000
-
-        try:
-            while True:
-                res = await self._db().table("users").select(
-                    "user_id"
-                ).or_(
-                    "is_banned.is.null,is_banned.eq.false"
-                ).order("user_id").range(
-                    start, start + size - 1
-                ).execute()
-
-                batch = [
-                    row["user_id"] for row in (res.data or [])
-                ]
-                ids.extend(batch)
-
-                if len(batch) < size:
-                    break
-                start += size
-
-        except Exception:
-            logger.exception("Error fetching broadcast users")
-
-        return ids
-
     # ================================================================
-    # ATOMIC BALANCE AND COUNTER UPDATES
+    # ATOMIC BALANCE AND COUNTER UPDATES (Race condition safe)
     # ================================================================
 
     async def _apply_deltas(
@@ -402,8 +291,8 @@ class Database:
         retries: int = 8,
     ) -> tuple[str, Optional[dict]]:
         """
-        Compare-and-swap update.
-        একই সময়ে একাধিক request এলে lost update কমায়।
+        Compare-and-swap atomic update.
+        একই সময়ে একাধিক request এলে lost update কমায়।
         """
         client = self._db()
         fields = list(deltas)
@@ -462,6 +351,7 @@ class Database:
         user_id: int,
         amount: float,
     ) -> bool:
+        """Atomically add balance (safe for concurrent requests)."""
         if not math.isfinite(amount):
             return False
 
@@ -471,8 +361,212 @@ class Database:
         )
         return status == "ok"
 
+    async def apply_balance_delta_safe(
+        self,
+        user_id: int,
+        amount: float,
+        reason: str = "unspecified",
+    ) -> tuple[bool, Optional[float]]:
+        """
+        Safely apply balance changes with delta updates.
+        Used by CSV processor and admin operations.
+        Returns (success, new_balance).
+        """
+        if not math.isfinite(amount) or amount == 0:
+            return False, None
+
+        status, updated = await self._apply_deltas(
+            user_id,
+            {"balance": amount},
+        )
+
+        if status == "ok":
+            new_balance = updated.get("balance", 0.0) if updated else None
+            logger.info(
+                f"Balance delta applied: user_id={user_id}, amount={amount}, reason={reason}, new_balance={new_balance}"
+            )
+            return True, new_balance
+        elif status == "insufficient":
+            logger.warning(f"Insufficient balance for user {user_id}")
+            return False, None
+        else:
+            logger.error(f"Failed to apply delta for user {user_id}: {status}")
+            return False, None
+
     # ================================================================
-    # DAILY BONUS (BANGLADESH TIME)
+    # GIFT CODES
+    # ================================================================
+
+    async def create_gift_code(
+        self,
+        code: str,
+        reward: float,
+        quantity: int = 1,
+        expires_days: int = 30,
+    ) -> bool:
+        """Create new gift codes for users to redeem."""
+        try:
+            expire_date = datetime.now(BD_TZ) + timedelta(days=expires_days)
+            
+            for _ in range(quantity):
+                await self._db().table("gift_codes").insert({
+                    "code": code,
+                    "reward": reward,
+                    "redeemed_by": None,
+                    "redeemed_at": None,
+                    "expires_at": expire_date.isoformat(),
+                    "is_active": True,
+                }).execute()
+            
+            logger.info(f"Gift codes created: {code} x{quantity}, reward={reward}")
+            return True
+        except Exception:
+            logger.exception(f"Error creating gift code {code}")
+            return False
+
+    async def redeem_gift_code(self, user_id: int, code: str) -> tuple[bool, str, float]:
+        """
+        Redeem a gift code for a user.
+        Returns (success, message, reward_amount).
+        """
+        try:
+            # Get unused gift code
+            res = await self._db().table("gift_codes").select(
+                "*"
+            ).eq("code", code).eq(
+                "is_active", True
+            ).is_("redeemed_by", "null").limit(1).execute()
+
+            if not res.data:
+                return False, "❌ এই কোড বৈধ নয় বা ইতিমধ্যে ব্যবহৃত হয়েছে।", 0.0
+
+            gift_code = res.data[0]
+            expires_at = datetime.fromisoformat(gift_code["expires_at"])
+            
+            if datetime.now(BD_TZ) > expires_at:
+                await self._db().table("gift_codes").update(
+                    {"is_active": False}
+                ).eq("id", gift_code["id"]).execute()
+                return False, "❌ এই কোডের মেয়াদ শেষ হয়ে গেছে।", 0.0
+
+            # Mark as redeemed
+            reward = float(gift_code["reward"])
+            await self._db().table("gift_codes").update({
+                "redeemed_by": user_id,
+                "redeemed_at": datetime.now(BD_TZ).isoformat(),
+            }).eq("id", gift_code["id"]).execute()
+
+            # Add balance
+            success, _ = await self.apply_balance_delta_safe(
+                user_id,
+                reward,
+                reason=f"gift_code_redemption:{code}"
+            )
+
+            if success:
+                return True, f"✅ গিফট কোড রিডিম হয়েছে! আপনার অ্যাকাউন্টে {reward:.2f} যোগ হয়েছে।", reward
+            else:
+                # Revert redemption if balance update fails
+                await self._db().table("gift_codes").update({
+                    "redeemed_by": None,
+                    "redeemed_at": None,
+                }).eq("id", gift_code["id"]).execute()
+                return False, "❌ পুরস্কার যুক্ত করতে ব্যর্থ হয়েছে। পুনরায় চেষ্টা করুন।", 0.0
+
+        except Exception:
+            logger.exception(f"Error redeeming gift code {code} for user {user_id}")
+            return False, "⚠️ একটি ত্রুটি ঘটেছে। পরে চেষ্টা করুন।", 0.0
+
+    async def get_active_gift_codes_count(self) -> int:
+        """Get count of unredeemed active gift codes."""
+        try:
+            res = await self._db().table("gift_codes").select(
+                "id", count="exact"
+            ).eq("is_active", True).is_(
+                "redeemed_by", "null"
+            ).execute()
+            return int(res.count or 0)
+        except Exception:
+            logger.exception("Error counting active gift codes")
+            return 0
+
+    # ================================================================
+    # CSV IMPORT/EXPORT FOR ADMIN
+    # ================================================================
+
+    async def bulk_update_balances(
+        self,
+        updates: list[tuple[int, float, str]],  # [(user_id, delta, reason), ...]
+    ) -> dict:
+        """
+        Safely bulk update user balances using atomic deltas.
+        Returns stats: {success_count, failed_count, errors}
+        """
+        stats = {
+            "success_count": 0,
+            "failed_count": 0,
+            "errors": [],
+        }
+
+        for user_id, delta, reason in updates:
+            try:
+                if not isinstance(user_id, int) or not math.isfinite(float(delta)):
+                    stats["failed_count"] += 1
+                    stats["errors"].append(f"Invalid data: user={user_id}, delta={delta}")
+                    continue
+
+                success, new_balance = await self.apply_balance_delta_safe(
+                    user_id,
+                    float(delta),
+                    reason=reason,
+                )
+
+                if success:
+                    stats["success_count"] += 1
+                else:
+                    stats["failed_count"] += 1
+                    stats["errors"].append(f"Failed to update balance for user {user_id}")
+
+            except Exception as e:
+                stats["failed_count"] += 1
+                stats["errors"].append(f"Error updating user {user_id}: {str(e)}")
+                logger.exception(f"Error in bulk balance update for user {user_id}")
+
+        return stats
+
+    async def bulk_distribute_referral_commissions(
+        self,
+        commissions: dict[int, float],  # {referrer_id: commission_amount, ...}
+    ) -> dict:
+        """
+        Bulk distribute referral commissions to referrers.
+        Returns stats.
+        """
+        updates = [
+            (referrer_id, commission, "referral_commission_distribution")
+            for referrer_id, commission in commissions.items()
+        ]
+        return await self.bulk_update_balances(updates)
+
+    async def get_pending_submissions_for_csv(
+        self,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Export pending task submissions as CSV data."""
+        try:
+            res = await self._db().table("user_submissions").select(
+                "id, user_id, task_id, submission_data, status, created_at, updated_at"
+            ).eq("status", "pending").order(
+                "created_at", desc=False
+            ).limit(limit).execute()
+
+            return res.data or []
+        except Exception:
+            logger.exception("Error fetching pending submissions for CSV")
+            return []
+
+    # ================================================================
+    # DAILY BONUS
     # ================================================================
 
     async def claim_daily_bonus(
@@ -482,7 +576,7 @@ class Database:
         try:
             user = await self.get_user(user_id)
             if not user:
-                return False, "⚠️ ইউজার পাওয়া যায়নি।", 0.0
+                return False, "⚠️ ইউজার পাওয়া যায়নি।", 0.0
 
             today = today_bd()
             bonus = await self.get_float_setting("daily_bonus", 1.0)
@@ -492,7 +586,6 @@ class Database:
 
             old_checkin = user.get("last_checkin")
 
-            # Conditional update: একই দিনে দ্বিতীয়বার claim আটকায়।
             marked = await self._db().table("users").update(
                 {"last_checkin": today}
             ).eq(
@@ -502,11 +595,7 @@ class Database:
             ).select("*").execute()
 
             if not marked.data:
-                return (
-                    False,
-                    "⚠️ আপনি আজকের বোনাস ইতিমধ্যেই নিয়েছেন।",
-                    0.0,
-                )
+                return False, "⚠️ আজকের বোনাস ইতিমধ্যে দাবি করা হয়েছে।", 0.0
 
             status, _ = await self._apply_deltas(
                 user_id,
@@ -514,618 +603,33 @@ class Database:
             )
 
             if status != "ok":
-                # Rollback কেবল তখনই, যদি check-in এখনও আমাদের
-                # claim করা তারিখেই থাকে।
-                rollback = self._db().table("users").update(
+                await self._db().table("users").update(
                     {"last_checkin": old_checkin}
-                ).eq(
-                    "user_id", user_id
-                ).eq("last_checkin", today)
+                ).eq("user_id", user_id).execute()
+                return False, "⚠️ বোনাস যোগ করতে ব্যর্থ।", 0.0
 
-                if old_checkin is None:
-                    await rollback.execute()
-                else:
-                    await rollback.eq(
-                        "last_checkin", today
-                    ).execute()
-
-                return False, "⚠️ বোনাস যোগ করা যায়নি।", 0.0
-
-            return (
-                True,
-                f"🎉 আপনি +{bonus:g} BDT ডেইলি বোনাস পেয়েছেন!",
-                bonus,
-            )
+            return True, f"✅ আপনি {_fmt(bonus)} পেয়েছেন!", bonus
 
         except Exception:
-            logger.exception("Error claiming daily bonus for %s", user_id)
-            return False, "⚠️ বোনাস ক্লেইম করতে সমস্যা হয়েছে।", 0.0
-
-    # ================================================================
-    # TASKS: tasks TABLE
-    # ================================================================
-
-    async def add_bulk_tasks(self, task_list: list[dict]) -> int:
-        inserted = 0
-        client = self._db()
-
-        try:
-            for start in range(0, len(task_list), 200):
-                batch = task_list[start:start + 200]
-                res = await client.table("tasks").insert(batch).execute()
-                inserted += len(res.data or [])
-        except Exception:
-            logger.exception("Error inserting bulk tasks")
-
-        return inserted
+            logger.exception("Error claiming daily bonus")
+            return False, "⚠️ একটি ত্রুটি ঘটেছে।", 0.0
 
     async def get_stock_count(self) -> int:
+        """Get available tasks in stock."""
         try:
             res = await self._db().table("tasks").select(
                 "id", count="exact"
-            ).eq("status", "available").limit(1).execute()
+            ).eq("status", "available").execute()
             return int(res.count or 0)
         except Exception:
-            logger.exception("Error getting task stock count")
+            logger.exception("Error counting stock")
             return 0
 
-    async def _release_stale_tasks(self) -> None:
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=max(1, TASK_STALE_MINUTES))
-        ).isoformat()
 
-        try:
-            await self._db().table("tasks").update({
-                "status": "available",
-                "assigned_to": None,
-                "assigned_at": None,
-            }).eq(
-                "status", "assigned"
-            ).lt("assigned_at", cutoff).execute()
-        except Exception:
-            logger.exception("Error releasing stale tasks")
-
-    async def get_user_assigned_task(
-        self,
-        user_id: int,
-    ) -> Optional[dict]:
-        try:
-            res = await self._db().table("tasks").select(
-                "*"
-            ).eq(
-                "assigned_to", user_id
-            ).eq(
-                "status", "assigned"
-            ).order(
-                "id", desc=True
-            ).limit(1).execute()
-
-            return res.data[0] if res.data else None
-        except Exception:
-            logger.exception("Error fetching assigned task")
-            return None
-
-    async def claim_task(
-        self,
-        user_id: int,
-        fallback_task: Optional[dict] = None,
-    ) -> Optional[dict]:
-        try:
-            existing = await self.get_user_assigned_task(user_id)
-            if existing:
-                return existing
-
-            await self._release_stale_tasks()
-            client = self._db()
-
-            for _ in range(5):
-                available = await client.table("tasks").select(
-                    "id"
-                ).eq(
-                    "status", "available"
-                ).order("id").limit(1).execute()
-
-                if not available.data:
-                    break
-
-                task_id = available.data[0]["id"]
-                now = datetime.now(timezone.utc).isoformat()
-
-                claimed = await client.table("tasks").update({
-                    "status": "assigned",
-                    "assigned_to": user_id,
-                    "assigned_at": now,
-                }).eq(
-                    "id", task_id
-                ).eq(
-                    "status", "available"
-                ).select("*").execute()
-
-                if claimed.data:
-                    return claimed.data[0]
-
-                await asyncio.sleep(0.05)
-
-            # fallback_task থাকলে সেটির schema অবশ্যই tasks table-এর
-            # সঙ্গে মিলতে হবে এবং প্রয়োজনীয় অনুমতি থাকতে হবে।
-            if fallback_task:
-                row = dict(fallback_task)
-                row.update({
-                    "status": "assigned",
-                    "assigned_to": user_id,
-                    "assigned_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-                })
-                created = await client.table("tasks").insert(
-                    row
-                ).execute()
-                return created.data[0] if created.data else None
-
-            return None
-
-        except Exception:
-            logger.exception("Error claiming task for %s", user_id)
-            return None
-
-    async def release_user_task(self, user_id: int) -> None:
-        try:
-            await self._db().table("tasks").update({
-                "status": "available",
-                "assigned_to": None,
-                "assigned_at": None,
-            }).eq(
-                "assigned_to", user_id
-            ).eq(
-                "status", "assigned"
-            ).execute()
-        except Exception:
-            logger.exception("Error releasing task for %s", user_id)
-
-    async def complete_task(
-        self,
-        task_id: int,
-        user_id: int,
-    ) -> Optional[dict]:
-        """
-        Assigned task সম্পন্ন করে reward দেয়।
-        Task-এর reward কলাম থাকতে হবে।
-        """
-        try:
-            client = self._db()
-
-            completed = await client.table("tasks").update({
-                "status": "completed",
-            }).eq(
-                "id", task_id
-            ).eq(
-                "assigned_to", user_id
-            ).eq(
-                "status", "assigned"
-            ).select("*").execute()
-
-            if not completed.data:
-                return None
-
-            task = completed.data[0]
-            reward = float(task.get("reward") or 0)
-
-            if not math.isfinite(reward) or reward < 0:
-                await client.table("tasks").update({
-                    "status": "assigned",
-                }).eq(
-                    "id", task_id
-                ).eq("status", "completed").execute()
-                return None
-
-            status, user_row = await self._apply_deltas(
-                user_id,
-                {"balance": reward, "completed_tasks": 1},
-            )
-
-            if status != "ok":
-                # Rollback শুধুমাত্র task এখনও completed থাকলে।
-                await client.table("tasks").update({
-                    "status": "assigned",
-                }).eq(
-                    "id", task_id
-                ).eq(
-                    "assigned_to", user_id
-                ).eq(
-                    "status", "completed"
-                ).execute()
-                return None
-
-            result = {
-                "reward": reward,
-                "referrer_id": None,
-                "commission": 0.0,
-            }
-
-            referrer_id = (user_row or {}).get("referred_by")
-
-            if referrer_id and referrer_id != user_id:
-                pct = await self.get_float_setting(
-                    "referral_commission", 10.0
-                )
-                commission = round(
-                    reward * max(0.0, pct) / 100.0, 4
-                )
-
-                if commission > 0:
-                    ref_status, _ = await self._apply_deltas(
-                        referrer_id,
-                        {
-                            "balance": commission,
-                            "referral_income": commission,
-                        },
-                    )
-
-                    if ref_status == "ok":
-                        result.update({
-                            "referrer_id": referrer_id,
-                            "commission": commission,
-                        })
-
-            return result
-
-        except Exception:
-            logger.exception("Error completing task %s", task_id)
-            return None
-
-    # ================================================================
-    # STOCK ACCOUNTS
-    # ================================================================
-
-    async def add_stock_account(
-        self,
-        category: str,
-        account_data: str,
-    ) -> bool:
-        try:
-            await self._db().table("stock_accounts").insert({
-                "category": category,
-                "account_data": account_data,
-                "is_used": False,
-            }).execute()
-            return True
-        except Exception:
-            logger.exception("Error adding stock account")
-            return False
-
-    async def get_unused_stock(
-        self,
-        category: str,
-    ) -> Optional[dict]:
-        try:
-            res = await self._db().table("stock_accounts").select(
-                "*"
-            ).eq(
-                "category", category
-            ).eq(
-                "is_used", False
-            ).order("id").limit(1).execute()
-
-            return res.data[0] if res.data else None
-        except Exception:
-            logger.exception("Error fetching stock")
-            return None
-
-    async def mark_stock_as_used(
-        self,
-        stock_id: int,
-        user_id: int,
-    ) -> bool:
-        try:
-            res = await self._db().table("stock_accounts").update({
-                "is_used": True,
-                "assigned_to": user_id,
-            }).eq(
-                "id", stock_id
-            ).eq(
-                "is_used", False
-            ).select("*").execute()
-
-            return bool(res.data)
-        except Exception:
-            logger.exception("Error marking stock as used")
-            return False
-
-    # ================================================================
-    # SUBMISSIONS & ADMIN REVIEWS
-    # ================================================================
-
-    async def add_submission(
-        self,
-        user_id: int,
-        category: str,
-        data: str,
-        status: str = "pending",
-    ) -> Optional[int]:
-        try:
-            res = await self._db().table("user_submissions").insert({
-                "user_id": user_id,
-                "category": category,
-                "details": data,
-                "status": status,
-            }).execute()
-
-            return res.data[0]["id"] if res.data else None
-        except Exception:
-            logger.exception("Error adding submission")
-            return None
-
-    async def update_submission_status(
-        self,
-        sub_id: int | str,
-        status: str,
-    ) -> bool:
-        if status not in {"pending", "accepted", "rejected"}:
-            return False
-
-        try:
-            res = await self._db().table(
-                "user_submissions"
-            ).update(
-                {"status": status}
-            ).eq(
-                "id", sub_id
-            ).select("id").execute()
-
-            return bool(res.data)
-        except Exception:
-            logger.exception("Error updating submission status")
-            return False
-
-    async def get_accepted_submissions(self) -> list[dict]:
-        try:
-            res = await self._db().table(
-                "user_submissions"
-            ).select("*").eq(
-                "status", "accepted"
-            ).execute()
-
-            return res.data or []
-        except Exception:
-            logger.exception("Error fetching accepted submissions")
-            return []
-
-    # ================================================================
-    # WITHDRAWALS
-    # ================================================================
-
-    async def create_withdrawal(
-        self,
-        user_id: int,
-        amount: float,
-        method: str,
-        account_no: str,
-    ) -> tuple[str, Optional[dict]]:
-        """
-        Return status: ok, below_min, insufficient, error.
-        """
-        if not math.isfinite(amount) or amount <= 0:
-            return "error", None
-
-        try:
-            minimum = await self.get_float_setting(
-                "min_withdraw", 50.0
-            )
-
-            if amount < minimum:
-                return "below_min", None
-
-            status, _ = await self._apply_deltas(
-                user_id,
-                {"balance": -amount},
-                forbid_negative_balance=True,
-            )
-
-            if status == "insufficient":
-                return "insufficient", None
-            if status != "ok":
-                return "error", None
-
-            try:
-                res = await self._db().table("withdrawals").insert({
-                    "user_id": user_id,
-                    "amount": amount,
-                    "method": method,
-                    "account_no": account_no,
-                    "status": "pending",
-                }).execute()
-
-                if not res.data:
-                    raise RuntimeError("Withdrawal insert returned no row")
-
-                return "ok", res.data[0]
-
-            except Exception:
-                logger.exception("Withdrawal insert failed; refunding")
-                refund_status, _ = await self._apply_deltas(
-                    user_id, {"balance": amount}
-                )
-
-                if refund_status != "ok":
-                    logger.critical(
-                        "Withdrawal refund needs manual reconciliation "
-                        "for user_id=%s, amount=%s",
-                        user_id,
-                        amount,
-                    )
-
-                return "error", None
-
-        except Exception:
-            logger.exception("Error creating withdrawal")
-            return "error", None
-
-    async def get_pending_withdrawals(
-        self,
-        limit: int = 20,
-    ) -> tuple[list[dict], int]:
-        try:
-            limit = max(1, min(limit, 100))
-            res = await self._db().table("withdrawals").select(
-                "*", count="exact"
-            ).eq(
-                "status", "pending"
-            ).order(
-                "id"
-            ).limit(limit).execute()
-
-            return res.data or [], int(res.count or 0)
-        except Exception:
-            logger.exception("Error fetching withdrawals")
-            return [], 0
-
-    async def count_pending_withdrawals(self) -> int:
-        try:
-            res = await self._db().table("withdrawals").select(
-                "id", count="exact"
-            ).eq("status", "pending").limit(1).execute()
-
-            return int(res.count or 0)
-        except Exception:
-            logger.exception("Error counting withdrawals")
-            return 0
-
-    async def update_withdrawal_status(
-        self,
-        withdrawal_id: int,
-        status: str,
-    ) -> tuple[bool, Optional[dict]]:
-        if status not in {"approved", "rejected"}:
-            return False, None
-
-        try:
-            updated = await self._db().table(
-                "withdrawals"
-            ).update(
-                {"status": status}
-            ).eq(
-                "id", withdrawal_id
-            ).eq(
-                "status", "pending"
-            ).select("*").execute()
-
-            if not updated.data:
-                return False, None
-
-            withdrawal = updated.data[0]
-
-            if status == "rejected":
-                refund_status, _ = await self._apply_deltas(
-                    withdrawal["user_id"],
-                    {"balance": float(withdrawal["amount"])},
-                )
-
-                if refund_status != "ok":
-                    # Refund ব্যর্থ হলে pending-এ ফেরানোর চেষ্টা।
-                    await self._db().table(
-                        "withdrawals"
-                    ).update(
-                        {"status": "pending"}
-                    ).eq(
-                        "id", withdrawal_id
-                    ).eq(
-                        "status", "rejected"
-                    ).execute()
-
-                    logger.critical(
-                        "Withdrawal refund failed for id=%s",
-                        withdrawal_id,
-                    )
-                    return False, None
-
-            return True, withdrawal
-
-        except Exception:
-            logger.exception("Error updating withdrawal status")
-            return False, None
-
-    # ================================================================
-    # SINGLE-INSTANCE BOT LEASE
-    # bot_lock columns: id, owner, heartbeat
-    # ================================================================
-
-    async def acquire_leader(self) -> Optional[bool]:
-        if not self._lock_available:
-            return None
-
-        now = int(time.time())
-        client = self._db()
-
-        try:
-            updated = await client.table("bot_lock").update({
-                "owner": INSTANCE_ID,
-                "heartbeat": now,
-            }).eq(
-                "id", LOCK_ROW_ID
-            ).or_(
-                f"owner.eq.{INSTANCE_ID},heartbeat.lt.{now - LOCK_TTL}"
-            ).select("*").execute()
-
-            if updated.data:
-                return True
-
-            exists = await client.table("bot_lock").select(
-                "id"
-            ).eq(
-                "id", LOCK_ROW_ID
-            ).limit(1).execute()
-
-            if exists.data:
-                return False
-
-            try:
-                await client.table("bot_lock").insert({
-                    "id": LOCK_ROW_ID,
-                    "owner": INSTANCE_ID,
-                    "heartbeat": now,
-                }).execute()
-                return True
-            except Exception:
-                # অন্য instance একই সময়ে row তৈরি করতে পারে।
-                return False
-
-        except Exception:
-            logger.exception(
-                "bot_lock unavailable; refusing unsafe leader acquisition"
-            )
-            self._lock_available = False
-            return None
-
-    async def renew_leader(self) -> str:
-        try:
-            res = await self._db().table("bot_lock").update({
-                "heartbeat": int(time.time()),
-            }).eq(
-                "id", LOCK_ROW_ID
-            ).eq(
-                "owner", INSTANCE_ID
-            ).select("id").execute()
-
-            return "ok" if res.data else "lost"
-        except Exception:
-            logger.exception("Leader lease renewal failed")
-            return "error"
-
-    async def release_leader(self) -> None:
-        if not self._lock_available or self.client is None:
-            return
-
-        try:
-            await self._db().table("bot_lock").update({
-                "heartbeat": 0,
-            }).eq(
-                "id", LOCK_ROW_ID
-            ).eq(
-                "owner", INSTANCE_ID
-            ).execute()
-        except Exception:
-            logger.exception("Leader lease release failed")
-
-
+# Global instance
 db = Database()
+
+
+def _fmt(x) -> str:
+    """Format float to 2 decimal places."""
+    return f"{float(x):.2f}"
